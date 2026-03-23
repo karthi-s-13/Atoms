@@ -1,19 +1,27 @@
 export type SignalState = "GREEN" | "GREEN_LEFT" | "YELLOW" | "RED";
 export type ControllerPhase = "PHASE_GREEN" | "PHASE_YELLOW" | "PHASE_ALL_RED";
-export type SignalCycleState = "NS_STRAIGHT" | "EW_STRAIGHT" | "NS_LEFT" | "EW_LEFT";
+export type SignalCycleState = "NORTH" | "EAST" | "SOUTH" | "WEST";
 export type Approach = "NORTH" | "SOUTH" | "EAST" | "WEST";
 export type RoadDirection = "NS" | "EW";
 export type ActorState = "MOVING" | "STOPPED";
-export type PedestrianState = "WAITING" | "CROSSING";
+export type PedestrianState = "WAITING" | "CROSSING" | "EXITING";
 export type VehicleKind = "car" | "ambulance" | "firetruck" | "police";
 export type AiMode = "fixed" | "adaptive" | "emergency" | "pedestrian";
-export type RouteType = "straight" | "right" | "left";
+export type RouteType = "straight" | "right";
 export type LaneKind = "main" | "slip";
-export type LaneMovement = "STRAIGHT" | "RIGHT" | "LEFT";
+export type LaneMovement = "STRAIGHT" | "RIGHT";
 
 export interface Point2D {
   x: number;
   y: number;
+}
+
+export interface LaneArcView {
+  center: Point2D;
+  radius: number;
+  start_angle: number;
+  end_angle: number;
+  clockwise: boolean;
 }
 
 export interface LaneView {
@@ -28,6 +36,9 @@ export interface LaneView {
   crosswalk_id: string;
   stop_line_position: Point2D;
   crosswalk_start: Point2D;
+  arc?: LaneArcView | null;
+  turn_entry?: Point2D | null;
+  turn_exit?: Point2D | null;
 }
 
 export interface CrosswalkView {
@@ -78,6 +89,9 @@ export interface PedestrianView {
   is_impatient: boolean;
   risky_crossing: boolean;
   look_angle: number;
+  shirt_color: string;
+  pants_color: string;
+  body_scale: number;
 }
 
 export interface MetricsView {
@@ -121,6 +135,9 @@ export interface PhaseScoreView {
   demand_active: boolean;
   recommended_hold: boolean;
   decision_reason: string;
+  neighbor_arrival_boost: number;
+  green_wave_boost: number;
+  downstream_congestion_penalty: number;
 }
 
 export interface CongestionAlertView {
@@ -156,6 +173,44 @@ export interface EventView {
   message: string;
 }
 
+export interface NetworkLinkView {
+  id: string;
+  source_intersection_id: string;
+  target_intersection_id: string;
+  source_exit: Approach;
+  target_approach: Approach;
+  travel_time: number;
+  in_transit_vehicles: number;
+  outgoing_flow_rate: number;
+  incoming_estimate: number;
+  congestion_gate: string;
+  green_wave_eta: number;
+}
+
+export interface IntersectionNetworkView {
+  id: string;
+  label: string;
+  offset: Point2D;
+  active_phase: SignalCycleState;
+  controller_phase: ControllerPhase;
+  congestion_level: number;
+  outgoing_flow_rate: number;
+  incoming_estimate: number;
+  queued_vehicles: number;
+  vehicle_count: number;
+  signals: Record<string, SignalState>;
+  metrics: MetricsView;
+  traffic_brain: TrafficBrainView;
+}
+
+export interface TrafficNetworkView {
+  focus_intersection_id: string;
+  coordination_mode: string;
+  intersections: Record<string, IntersectionNetworkView>;
+  links: NetworkLinkView[];
+  congestion_zones: string[];
+}
+
 export interface SimulationConfig {
   traffic_intensity: number;
   ambulance_frequency: number;
@@ -170,7 +225,8 @@ export interface SnapshotView {
   frame: number;
   timestamp: number;
   current_state: SignalCycleState;
-  active_direction: RoadDirection | null;
+  active_direction: Approach | null;
+  intersection_id: string;
   controller_phase: ControllerPhase;
   phase_timer: number;
   phase_duration: number;
@@ -183,6 +239,7 @@ export interface SnapshotView {
   pedestrian_phase_active: boolean;
   metrics: MetricsView;
   traffic_brain: TrafficBrainView;
+  network: TrafficNetworkView | null;
   events: EventView[];
   config: SimulationConfig;
 }

@@ -5,9 +5,9 @@ function formatPhase(state) {
 }
 
 const problemCards = [
-  { title: "Accident Detection", copy: "Realtime state streaming surfaces queue buildups, blocked crosswalks, and deadlocks before they cascade." },
-  { title: "Adaptive Phases", copy: "Rule-based demand scoring selects the next non-conflicting phase from queue length, wait time, and pedestrian pressure." },
-  { title: "Intent-Based Flow", copy: "Each car is assigned a straight or left intent and only moves when its protected movement is active." },
+  { title: "Accident Detection", copy: "Realtime state streaming surfaces queue buildups, blocked approaches, and deadlocks before they cascade." },
+  { title: "Deterministic Signals", copy: "Exactly one approach stays green at a time, cycling in a fixed order for predictable operation." },
+  { title: "Intent-Based Flow", copy: "Each car is assigned a straight or right intent, left turns are disabled, and every vehicle stays in its dedicated lane." },
   { title: "City Optimization", copy: "Impact metrics, throughput trends, and queue pressure snapshots help operators tune deployment strategy." },
 ];
 
@@ -16,8 +16,8 @@ const features = [
   "FastAPI websocket bridge",
   "Buffered interpolation for smooth motion",
   "Persistent camera state",
-  "Adaptive rule-based controller",
-  "Straight-phase zebra release",
+  "Deterministic one-direction controller",
+  "Lane-disciplined turn paths",
 ];
 
 export default function HomePage({ snapshot, connectionState }) {
@@ -29,7 +29,7 @@ export default function HomePage({ snapshot, connectionState }) {
         <div className="glass-panel rounded-[2rem] p-8">
           <p className="text-sm uppercase tracking-[0.3em] text-cyan-300">Hero</p>
           <h2 className="mt-4 max-w-3xl text-5xl font-semibold tracking-tight text-white">
-            Stable traffic control with clean path following, strict signal states, and synchronized crossings.
+            Stable traffic control with clean path following, strict signal states, and one green approach at a time.
           </h2>
           <p className="mt-5 max-w-2xl text-base leading-8 text-slate-300">
             The platform is split into a pure simulation engine, a dedicated realtime websocket server, and a React + Three.js
@@ -50,7 +50,7 @@ export default function HomePage({ snapshot, connectionState }) {
         <div className="glass-panel rounded-[2rem] p-8">
           <p className="panel-title">System Overview</p>
           <div className="mt-5 space-y-4 text-sm leading-7 text-slate-300">
-            <p>Simulation Engine: path-following cars, adaptive protected straight and left phases, one signal per approach, and pedestrian release only when the matching straight phase is active.</p>
+            <p>Simulation Engine: path-following cars, one green direction at a time, a dedicated straight lane, a dedicated right-turn lane, and stop-line enforcement before every zebra crossing.</p>
             <p>Realtime Server: authoritative 60 FPS clock, websocket streaming, health endpoint, and control acknowledgements.</p>
             <p>Frontend: buffered interpolation, persistent camera, operator controls, analytics dashboard, and impact modeling.</p>
           </div>
@@ -58,8 +58,8 @@ export default function HomePage({ snapshot, connectionState }) {
             <p className="metric-label">Live Snapshot</p>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               <div>
-                <p className="text-sm text-slate-400">Crosswalk Activity</p>
-                <p className="text-lg font-semibold text-white">{snapshot.pedestrian_phase_active ? "ACTIVE" : "IDLE"}</p>
+                <p className="text-sm text-slate-400">Pedestrian Mode</p>
+                <p className="text-lg font-semibold text-white">{(snapshot.config?.max_pedestrians ?? 0) > 0 ? (snapshot.pedestrian_phase_active ? "ACTIVE" : "CONTROLLED") : "DISABLED"}</p>
               </div>
               <div>
                 <p className="text-sm text-slate-400">Active Cars</p>

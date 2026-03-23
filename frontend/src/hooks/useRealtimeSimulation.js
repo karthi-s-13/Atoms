@@ -1,16 +1,16 @@
 import { startTransition, useEffect, useRef, useState } from "react";
 
 const APPROACHES = ["NORTH", "SOUTH", "EAST", "WEST"];
-const PHASES = ["NS_STRAIGHT", "NS_LEFT", "EW_STRAIGHT", "EW_LEFT"];
+const PHASES = ["NORTH", "EAST", "SOUTH", "WEST"];
 
 const DEFAULT_CONFIG = {
   traffic_intensity: 1,
   ambulance_frequency: 0.08,
-  ai_mode: "adaptive",
+  ai_mode: "fixed",
   speed_multiplier: 1,
   paused: false,
   max_vehicles: 36,
-  max_pedestrians: 12,
+  max_pedestrians: 0,
 };
 
 function defaultDirectionMetric(approach) {
@@ -43,12 +43,15 @@ function defaultPhaseScore(phase) {
     demand_active: false,
     recommended_hold: false,
     decision_reason: "Awaiting telemetry.",
+    neighbor_arrival_boost: 0,
+    green_wave_boost: 0,
+    downstream_congestion_penalty: 0,
   };
 }
 
 const DEFAULT_TRAFFIC_BRAIN = {
   active_phase_score: 0,
-  top_phase: "NS_STRAIGHT",
+  top_phase: "NORTH",
   strategy: "Awaiting telemetry.",
   direction_metrics: Object.fromEntries(APPROACHES.map((approach) => [approach, defaultDirectionMetric(approach)])),
   phase_scores: Object.fromEntries(PHASES.map((phase) => [phase, defaultPhaseScore(phase)])),
@@ -63,26 +66,35 @@ const DEFAULT_TRAFFIC_BRAIN = {
   },
 };
 
+const DEFAULT_NETWORK = {
+  focus_intersection_id: "",
+  coordination_mode: "Single intersection",
+  intersections: {},
+  links: [],
+  congestion_zones: [],
+};
+
 const DEFAULT_SNAPSHOT = {
   frame: 0,
   timestamp: 0,
-  current_state: "NS_STRAIGHT",
-  active_direction: "NS",
+  intersection_id: "",
+  current_state: "NORTH",
+  active_direction: "NORTH",
   controller_phase: "PHASE_GREEN",
   phase_timer: 0,
-  phase_duration: 11.5,
-  min_green_remaining: 4.5,
+  phase_duration: 7,
+  min_green_remaining: 7,
   vehicles: [],
   pedestrians: [],
   lanes: [],
   crosswalks: [],
   signals: {
     NORTH: "GREEN",
-    SOUTH: "GREEN",
+    SOUTH: "RED",
     EAST: "RED",
     WEST: "RED",
   },
-  pedestrian_phase_active: true,
+  pedestrian_phase_active: false,
   metrics: {
     avg_wait_time: 0,
     throughput: 0,
@@ -97,6 +109,7 @@ const DEFAULT_SNAPSHOT = {
     bandwidth_savings: 0,
   },
   traffic_brain: DEFAULT_TRAFFIC_BRAIN,
+  network: DEFAULT_NETWORK,
   events: [],
   config: DEFAULT_CONFIG,
 };
@@ -147,6 +160,15 @@ function normalizeSnapshot(snapshot) {
         ...DEFAULT_TRAFFIC_BRAIN.emergency,
         ...(snapshot.traffic_brain?.emergency ?? {}),
       },
+    },
+    network: {
+      ...DEFAULT_NETWORK,
+      ...(snapshot.network ?? {}),
+      intersections: snapshot.network?.intersections && typeof snapshot.network.intersections === "object"
+        ? snapshot.network.intersections
+        : {},
+      links: Array.isArray(snapshot.network?.links) ? snapshot.network.links : [],
+      congestion_zones: Array.isArray(snapshot.network?.congestion_zones) ? snapshot.network.congestion_zones : [],
     },
     config: { ...DEFAULT_CONFIG, ...(snapshot.config ?? {}) },
   };

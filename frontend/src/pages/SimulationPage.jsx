@@ -4,10 +4,10 @@ import SimulationCanvas from "../components/SimulationCanvas";
 
 const speedOptions = [0.5, 1, 2, 4];
 const phaseLabels = [
-  ["NS_STRAIGHT", "NS Straight"],
-  ["NS_LEFT", "NS Left"],
-  ["EW_STRAIGHT", "EW Straight"],
-  ["EW_LEFT", "EW Left"],
+  ["NORTH", "North"],
+  ["EAST", "East"],
+  ["SOUTH", "South"],
+  ["WEST", "West"],
 ];
 const signalGroups = [
   ["NORTH", "North Signal"],
@@ -64,7 +64,13 @@ export default function SimulationPage({
   const hudSnapshot = useDeferredValue(dashboardSnapshot);
   const metrics = hudSnapshot.metrics;
   const intelligence = hudSnapshot.traffic_brain;
-  const activePhaseScore = intelligence.phase_scores?.[hudSnapshot.current_state] ?? intelligence.phase_scores?.NS_STRAIGHT;
+  const network = hudSnapshot.network;
+  const networkIntersections = Object.values(network?.intersections ?? {});
+  const activePhaseScore = intelligence.phase_scores?.[hudSnapshot.current_state] ?? intelligence.phase_scores?.NORTH;
+  const pedestriansEnabled = (hudSnapshot.config?.max_pedestrians ?? 0) > 0;
+  const pedestrianMode = pedestriansEnabled
+    ? (hudSnapshot.pedestrian_phase_active ? "ACTIVE" : "CONTROLLED")
+    : "DISABLED";
   const vehicleStates = hudSnapshot.vehicles.reduce(
     (counts, vehicle) => {
       counts[vehicle.state] = (counts[vehicle.state] || 0) + 1;
@@ -72,14 +78,14 @@ export default function SimulationPage({
       counts[vehicle.route] = (counts[vehicle.route] || 0) + 1;
       return counts;
     },
-    { MOVING: 0, STOPPED: 0, NORTH: 0, SOUTH: 0, EAST: 0, WEST: 0, straight: 0, left: 0 },
+    { MOVING: 0, STOPPED: 0, NORTH: 0, SOUTH: 0, EAST: 0, WEST: 0, straight: 0, right: 0 },
   );
   const pedestrianStates = hudSnapshot.pedestrians.reduce(
     (counts, pedestrian) => {
       counts[pedestrian.state] = (counts[pedestrian.state] || 0) + 1;
       return counts;
     },
-    { WAITING: 0, CROSSING: 0 },
+    { WAITING: 0, CROSSING: 0, EXITING: 0 },
   );
 
   return (
@@ -90,7 +96,7 @@ export default function SimulationPage({
           <MetricCard label="Vehicles Processed" value={metrics.vehicles_processed} detail="completed trips" tone="cyan" />
           <MetricCard label="Avg Wait" value={`${metrics.avg_wait_time.toFixed(2)}s`} detail="lane delay" tone="amber" />
           <MetricCard label="Queue Pressure" value={`${Math.round(metrics.queue_pressure * 100)}%`} detail="stopped cars" tone="rose" />
-          <MetricCard label="Pedestrians" value={metrics.active_pedestrians} detail="crosswalk actors" tone="green" />
+          <MetricCard label="Throughput" value={`${metrics.throughput.toFixed(1)}/s`} detail="clearing rate" tone="green" />
         </div>
       </div>
 
@@ -131,11 +137,11 @@ export default function SimulationPage({
           <p className="panel-title">Signal Panel</p>
           <div className="mt-4 grid grid-cols-2 gap-3">
             <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
-              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Current Phase</p>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Current Green</p>
               <p className="mt-2 text-2xl font-semibold text-white">{formatPhase(hudSnapshot.current_state)}</p>
             </div>
             <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
-              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Stage</p>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Cycle Mode</p>
               <p className="mt-2 text-2xl font-semibold text-white">{formatStage(hudSnapshot.controller_phase)}</p>
             </div>
           </div>
@@ -146,7 +152,7 @@ export default function SimulationPage({
               <p className="mt-1 text-xs text-slate-400">of {hudSnapshot.phase_duration.toFixed(1)}s</p>
             </div>
             <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
-              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Min Green Remaining</p>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Time Remaining</p>
               <p className="mt-2 text-2xl font-semibold text-white">{hudSnapshot.min_green_remaining.toFixed(1)}s</p>
             </div>
           </div>
@@ -175,17 +181,23 @@ export default function SimulationPage({
             ))}
           </div>
           <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.04] p-4">
-            <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Crosswalk Release</p>
-            <p className="mt-2 text-2xl font-semibold text-white">{hudSnapshot.pedestrian_phase_active ? "ACTIVE" : "HOLD"}</p>
+            <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Pedestrian System</p>
+            <p className="mt-2 text-2xl font-semibold text-white">{pedestrianMode}</p>
+            <p className="mt-2 text-sm text-slate-300">
+              {pedestriansEnabled
+                ? `Waiting ${pedestrianStates.WAITING} | Crossing ${pedestrianStates.CROSSING} | Exiting ${pedestrianStates.EXITING}`
+                : "Pedestrian spawning is parked for this strict vehicle-discipline run."}
+            </p>
           </div>
           <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.04] p-4">
             <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Active Flow</p>
             <p className="mt-2 text-2xl font-semibold text-white">{hudSnapshot.active_direction ?? "NONE"}</p>
           </div>
           <div className="mt-4 text-sm leading-7 text-slate-300">
-            The controller now runs every movement through `GREEN`, `YELLOW`, and `ALL RED`, keeps all signals red during the
-            clearance buffer, allows only committed vehicles to finish on yellow, blocks new entries on all red, and keeps
-            pedestrian release limited to compatible straight greens.
+            The controller keeps exactly one approach green at a time, cycles in a fixed{" "}
+            <code>NORTH -&gt; EAST -&gt; SOUTH -&gt; WEST</code> order, keeps straight traffic in the outer left-side lane,
+            keeps right turns in the inner curb-side lane, disables left turns completely, and holds every other
+            approach at red until the active traffic clears.
           </div>
         </section>
 
@@ -193,12 +205,12 @@ export default function SimulationPage({
           <p className="panel-title">Traffic Intelligence</p>
           <div className="mt-4 grid gap-3 md:grid-cols-3">
             <div className="rounded-2xl border border-cyan-400/20 bg-cyan-500/10 p-4">
-              <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/80">Active Phase Score</p>
+              <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/80">Active Direction Score</p>
               <p className="mt-2 text-3xl font-semibold text-white">{(intelligence.active_phase_score ?? 0).toFixed(2)}</p>
               <p className="mt-2 text-sm text-slate-300">{activePhaseScore?.decision_reason}</p>
             </div>
             <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
-              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Recommended Phase</p>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Highest Demand</p>
               <p className="mt-2 text-2xl font-semibold text-white">{formatPhase(intelligence.top_phase)}</p>
               <p className="mt-2 text-sm text-slate-300">{intelligence.strategy}</p>
             </div>
@@ -253,27 +265,37 @@ export default function SimulationPage({
                   <div key={`${alert.approach}-${alert.level}`} className={`rounded-2xl border p-3 ${alertAccent(alert.level)}`}>
                     <p className="text-sm font-medium text-white">{alert.message}</p>
                     <p className="mt-1 text-xs text-white/70">
-                      Queue {Number(alert.queue_length ?? 0).toFixed(1)} • Delta {Number(alert.queue_delta ?? 0).toFixed(1)}
+                      Queue {Number(alert.queue_length ?? 0).toFixed(1)} | Delta {Number(alert.queue_delta ?? 0).toFixed(1)}
                     </p>
                   </div>
                 ))
               ) : (
-                <p className="text-sm text-slate-300">No active congestion alerts. Network conditions are stable.</p>
+                <p className="text-sm text-slate-300">No active congestion alerts. Local conditions are stable.</p>
               )}
             </div>
           </div>
         </section>
+
+        {networkIntersections.length || (Array.isArray(network?.links) && network.links.length) ? (
+          <section className="glass-panel rounded-[2rem] p-6">
+            <p className="panel-title">Network Overview</p>
+            <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.04] p-4">
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Coordination Mode</p>
+              <p className="mt-2 text-2xl font-semibold text-white">{network?.coordination_mode ?? "Local control"}</p>
+            </div>
+          </section>
+        ) : null}
 
         <section className="glass-panel rounded-[2rem] p-6">
           <p className="panel-title">Debug Surface</p>
           <div className="mt-4 grid gap-3 sm:grid-cols-3">
             <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
               <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Vehicle State</p>
-              <p className="mt-2 text-sm text-white">Moving: {vehicleStates.MOVING}</p>
-              <p className="mt-1 text-sm text-white">Stopped: {vehicleStates.STOPPED}</p>
-              <p className="mt-1 text-sm text-white">Straight: {vehicleStates.straight}</p>
-              <p className="mt-1 text-sm text-white">Left: {vehicleStates.left}</p>
-            </div>
+                  <p className="mt-2 text-sm text-white">Moving: {vehicleStates.MOVING}</p>
+                  <p className="mt-1 text-sm text-white">Stopped: {vehicleStates.STOPPED}</p>
+                  <p className="mt-1 text-sm text-white">Straight: {vehicleStates.straight}</p>
+                  <p className="mt-1 text-sm text-white">Right: {vehicleStates.right}</p>
+                </div>
             <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
               <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Approach Load</p>
               <p className="mt-2 text-sm text-white">North: {vehicleStates.NORTH}</p>
@@ -283,8 +305,13 @@ export default function SimulationPage({
             </div>
             <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
               <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Pedestrian State</p>
-              <p className="mt-2 text-sm text-white">Waiting: {pedestrianStates.WAITING}</p>
+              <p className="mt-2 text-sm text-white">
+                {pedestriansEnabled
+                  ? `Waiting: ${pedestrianStates.WAITING}`
+                  : "Disabled in current config"}
+              </p>
               <p className="mt-1 text-sm text-white">Crossing: {pedestrianStates.CROSSING}</p>
+              <p className="mt-1 text-sm text-white">Exiting: {pedestrianStates.EXITING}</p>
             </div>
           </div>
         </section>

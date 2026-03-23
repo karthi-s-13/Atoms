@@ -8,22 +8,31 @@ from typing import Dict, List, Literal
 
 SignalState = Literal["GREEN", "GREEN_LEFT", "YELLOW", "RED"]
 ControllerPhase = Literal["PHASE_GREEN", "PHASE_YELLOW", "PHASE_ALL_RED"]
-SignalCycleState = Literal["NS_STRAIGHT", "EW_STRAIGHT", "NS_LEFT", "EW_LEFT"]
+SignalCycleState = Literal["NORTH", "EAST", "SOUTH", "WEST"]
 Approach = Literal["NORTH", "SOUTH", "EAST", "WEST"]
 RoadDirection = Literal["NS", "EW"]
 ActorState = Literal["MOVING", "STOPPED"]
-PedestrianState = Literal["WAITING", "CROSSING"]
+PedestrianState = Literal["WAITING", "CROSSING", "EXITING"]
 VehicleKind = Literal["car", "ambulance", "firetruck", "police"]
 AiMode = Literal["fixed", "adaptive", "emergency", "pedestrian"]
-RouteType = Literal["straight", "right", "left"]
+RouteType = Literal["straight", "right"]
 LaneKind = Literal["main", "slip"]
-LaneMovement = Literal["STRAIGHT", "RIGHT", "LEFT"]
+LaneMovement = Literal["STRAIGHT", "RIGHT"]
 
 
 @dataclass
 class Point2D:
     x: float
     y: float
+
+
+@dataclass
+class LaneArcView:
+    center: Point2D
+    radius: float
+    start_angle: float
+    end_angle: float
+    clockwise: bool
 
 
 @dataclass
@@ -39,6 +48,9 @@ class LaneView:
     crosswalk_id: str
     stop_line_position: Point2D
     crosswalk_start: Point2D
+    arc: LaneArcView | None = None
+    turn_entry: Point2D | None = None
+    turn_exit: Point2D | None = None
 
 
 @dataclass
@@ -92,6 +104,9 @@ class PedestrianView:
     is_impatient: bool
     risky_crossing: bool
     look_angle: float
+    shirt_color: str = "#fb923c"
+    pants_color: str = "#334155"
+    body_scale: float = 1.0
 
 
 @dataclass
@@ -138,6 +153,9 @@ class PhaseScoreView:
     demand_active: bool
     recommended_hold: bool
     decision_reason: str = ""
+    neighbor_arrival_boost: float = 0.0
+    green_wave_boost: float = 0.0
+    downstream_congestion_penalty: float = 0.0
 
 
 @dataclass
@@ -178,6 +196,51 @@ class EventView:
 
 
 @dataclass
+class NetworkLinkView:
+    id: str
+    source_intersection_id: str
+    target_intersection_id: str
+    source_exit: Approach
+    target_approach: Approach
+    travel_time: float
+    in_transit_vehicles: int
+    outgoing_flow_rate: float
+    incoming_estimate: float
+    congestion_gate: str
+    green_wave_eta: float = 0.0
+
+
+@dataclass
+class IntersectionNetworkView:
+    id: str
+    label: str
+    offset: Point2D
+    active_phase: SignalCycleState
+    controller_phase: ControllerPhase
+    congestion_level: float
+    outgoing_flow_rate: float
+    incoming_estimate: float
+    queued_vehicles: int
+    vehicle_count: int
+    signals: Dict[str, SignalState] = field(default_factory=dict)
+    metrics: MetricsView = field(
+        default_factory=lambda: MetricsView(0.0, 0.0, 0, 0.0, 0, 0, 0, 0, 0, 0, 0.0)
+    )
+    traffic_brain: TrafficBrainView = field(
+        default_factory=lambda: TrafficBrainView(0.0, "NORTH", "Awaiting telemetry.")
+    )
+
+
+@dataclass
+class TrafficNetworkView:
+    focus_intersection_id: str
+    coordination_mode: str
+    intersections: Dict[str, IntersectionNetworkView] = field(default_factory=dict)
+    links: List[NetworkLinkView] = field(default_factory=list)
+    congestion_zones: List[str] = field(default_factory=list)
+
+
+@dataclass
 class SimulationConfig:
     traffic_intensity: float = 1.0
     ambulance_frequency: float = 0.08
@@ -185,7 +248,7 @@ class SimulationConfig:
     speed_multiplier: float = 1.0
     paused: bool = False
     max_vehicles: int = 48
-    max_pedestrians: int = 20
+    max_pedestrians: int = 0
 
 
 @dataclass
@@ -193,7 +256,8 @@ class SnapshotView:
     frame: int
     timestamp: float
     current_state: SignalCycleState
-    active_direction: RoadDirection | None
+    active_direction: Approach | None
+    intersection_id: str = ""
     controller_phase: ControllerPhase = "PHASE_GREEN"
     phase_timer: float = 0.0
     phase_duration: float = 0.0
@@ -208,8 +272,9 @@ class SnapshotView:
         default_factory=lambda: MetricsView(0.0, 0.0, 0, 0.0, 0, 0, 0, 0, 0, 0, 0.0)
     )
     traffic_brain: TrafficBrainView = field(
-        default_factory=lambda: TrafficBrainView(0.0, "NS_STRAIGHT", "Awaiting telemetry.")
+        default_factory=lambda: TrafficBrainView(0.0, "NORTH", "Awaiting telemetry.")
     )
+    network: TrafficNetworkView | None = None
     events: List[EventView] = field(default_factory=list)
     config: SimulationConfig = field(default_factory=SimulationConfig)
 

@@ -17,7 +17,7 @@ from fastapi import Body, FastAPI, File, HTTPException, UploadFile, WebSocket, W
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 
-from simulation_engine import FRAME_DT, TrafficSimulationEngine
+from simulation_engine import FRAME_DT, TrafficNetwork
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 AMBULANCE_CLASSIFIER_PATH = PROJECT_ROOT / "models" / "ambulance_yolo_cls.pt"
@@ -845,7 +845,7 @@ class SimulationRuntime:
     """Own the authoritative simulation clock and websocket fanout."""
 
     def __init__(self) -> None:
-        self.engine = TrafficSimulationEngine()
+        self.engine = TrafficNetwork()
         self.connections: Set[WebSocket] = set()
         self.lock = asyncio.Lock()
         self.running = False
@@ -924,7 +924,7 @@ class SimulationRuntime:
                 "message": message,
             }
             self.external_events.appendleft(event)
-            self.latest_snapshot = self._merge_external_events(self.engine.snapshot().to_dict())
+            self.latest_snapshot = self._merge_external_events(self._snapshot_dict(self.engine.snapshot()))
             payload = {
                 "type": "snapshot",
                 "snapshot": self.latest_snapshot,
@@ -951,7 +951,7 @@ class SimulationRuntime:
             else:
                 return {"type": "error", "message": f"Unknown message type: {message_type or 'empty'}"}
 
-            self.latest_snapshot = self._merge_external_events(self.engine.snapshot().to_dict())
+            self.latest_snapshot = self._merge_external_events(self._snapshot_dict(self.engine.snapshot()))
             return {"type": "ack", "action": message_type, "snapshot": self.latest_snapshot, "sent_at": round(time.time(), 6)}
 
     def _merge_external_events(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -963,6 +963,13 @@ class SimulationRuntime:
         metrics["detections"] = len(merged_events)
         merged_snapshot["metrics"] = metrics
         return merged_snapshot
+
+    def _snapshot_dict(self, snapshot: Any) -> Dict[str, Any]:
+        if isinstance(snapshot, dict):
+            return snapshot
+        if hasattr(snapshot, "to_dict"):
+            return snapshot.to_dict()
+        return {}
 
 
 def _coerce_int(value: Any) -> int:

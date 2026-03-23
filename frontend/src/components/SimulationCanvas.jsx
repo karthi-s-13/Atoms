@@ -1,4 +1,4 @@
-import { Line, OrbitControls, Text } from "@react-three/drei";
+import { Line, OrbitControls } from "@react-three/drei";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
@@ -24,6 +24,7 @@ const STRIPE_WIDTH = 0.6;
 const STRIPE_GAP = 0.55;
 const DASH_LENGTH = 3.2;
 const DASH_GAP = 2.2;
+const TURN_ARC_SAMPLES = 40;
 
 function shortestAngleLerp(start, end, alpha) {
   let delta = end - start;
@@ -99,13 +100,22 @@ function laneHeading(lane) {
   return Math.atan2(next.x - start.x, next.y - start.y);
 }
 
-function laneNormal(lane) {
+function laneLeftNormal(lane) {
   const start = lane.path?.[0] ?? lane.start;
   const next = lane.path?.[1] ?? lane.end;
   const dx = next.x - start.x;
   const dz = next.y - start.y;
   const length = Math.hypot(dx, dz) || 1;
-  return { x: dz / length, z: -dx / length };
+  return { x: -dz / length, z: dx / length };
+}
+
+function laneForward(lane) {
+  const start = lane.path?.[0] ?? lane.start;
+  const next = lane.path?.[1] ?? lane.end;
+  const dx = next.x - start.x;
+  const dz = next.y - start.y;
+  const length = Math.hypot(dx, dz) || 1;
+  return { x: dx / length, z: dz / length };
 }
 
 function lightDescriptor(state, lamp) {
@@ -122,21 +132,8 @@ function signalStateForApproach(signals, approach) {
   return signals?.[approach] ?? "RED";
 }
 
-function crosswalkMovementDirection(crosswalk) {
-  return Math.abs(crosswalk.movement.x) > Math.abs(crosswalk.movement.y) ? "EW" : "NS";
-}
-
-function isCrosswalkActive(crosswalk, currentPhase, controllerStage) {
-  if (controllerStage !== "PHASE_GREEN") {
-    return false;
-  }
-  if (currentPhase === "NS_STRAIGHT") {
-    return crosswalkMovementDirection(crosswalk) === "EW";
-  }
-  if (currentPhase === "EW_STRAIGHT") {
-    return crosswalkMovementDirection(crosswalk) === "NS";
-  }
-  return false;
+function isCrosswalkActive(crosswalk, activeCrosswalkIds) {
+  return activeCrosswalkIds.has(crosswalk.id);
 }
 
 function pedestrianFacing(pedestrian) {
@@ -161,6 +158,69 @@ function buildDashCenters(rangeStart, rangeEnd) {
     centers.push(center);
   }
   return centers;
+}
+
+function pushUniqueLanePoint(points, point) {
+  const previous = points[points.length - 1];
+  if (!previous) {
+    points.push(point);
+    return;
+  }
+  if (Math.hypot(previous[0] - point[0], previous[2] - point[2]) > 1e-4) {
+    points.push(point);
+  }
+}
+
+function laneDebugPoints(lane) {
+  const points = [];
+  const appendPoint2D = (point) => {
+    if (!point) {
+      return;
+    }
+    pushUniqueLanePoint(points, [point.x, 0.08, point.y]);
+  };
+
+  appendPoint2D(lane.start);
+
+  if (lane.arc && lane.turn_entry && lane.turn_exit) {
+    appendPoint2D(lane.turn_entry);
+    const curve = new THREE.EllipseCurve(
+      lane.arc.center.x,
+      lane.arc.center.y,
+      lane.arc.radius,
+      lane.arc.radius,
+      lane.arc.start_angle,
+      lane.arc.end_angle,
+      lane.arc.clockwise,
+      0,
+    );
+    curve.getPoints(TURN_ARC_SAMPLES).forEach((point) => {
+      pushUniqueLanePoint(points, [point.x, 0.08, point.y]);
+    });
+    appendPoint2D(lane.turn_exit);
+    appendPoint2D(lane.end);
+    return points;
+  }
+
+  (lane.path ?? []).forEach(appendPoint2D);
+  appendPoint2D(lane.end);
+  return points;
+}
+
+function stopLaneKey(lane) {
+  return `${lane.approach}:${lane.stop_line_position.x.toFixed(2)}:${lane.stop_line_position.y.toFixed(2)}`;
+}
+
+function uniquePhysicalLanes(lanes) {
+  const seen = new Set();
+  return lanes.filter((lane) => {
+    const key = stopLaneKey(lane);
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function dividerSegments() {
@@ -227,22 +287,28 @@ function SurfaceStripe({ segment }) {
 }
 
 function buildSignalDescriptor(lanes, signals) {
-  const representativeLane = lanes.find((lane) => lane.movement === "STRAIGHT") ?? lanes[0];
-  const normal = laneNormal(representativeLane);
-  const stopPoint = lanes.reduce(
+  const physicalLanes = uniquePhysicalLanes(lanes);
+  const representativeLane = physicalLanes.find((lane) => lane.movement === "STRAIGHT") ?? physicalLanes[0];
+  const leftNormal = laneLeftNormal(representativeLane);
+  const forward = laneForward(representativeLane);
+  const stopPoint = physicalLanes.reduce(
     (accumulator, lane) => ({
       x: accumulator.x + lane.stop_line_position.x,
       y: accumulator.y + lane.stop_line_position.y,
     }),
     { x: 0, y: 0 },
   );
-  stopPoint.x /= lanes.length;
-  stopPoint.y /= lanes.length;
+  stopPoint.x /= physicalLanes.length;
+  stopPoint.y /= physicalLanes.length;
 
   return {
     id: representativeLane.approach,
     state: signalStateForApproach(signals, representativeLane.approach),
-    position: [stopPoint.x + (normal.x * 4.6), 0, stopPoint.y + (normal.z * 4.6)],
+    position: [
+      stopPoint.x + (leftNormal.x * 4.2) - (forward.x * 1.6),
+      0,
+      stopPoint.y + (leftNormal.z * 4.2) - (forward.z * 1.6),
+    ],
     facing: laneHeading(representativeLane) + Math.PI,
   };
 }
@@ -252,7 +318,6 @@ function SignalHead({ signal }) {
   const redLight = lightDescriptor(state, "RED");
   const yellowLight = lightDescriptor(state, "YELLOW");
   const greenLight = lightDescriptor(state, "GREEN");
-  const leftTurnActive = state === "GREEN_LEFT";
 
   return (
     <group position={position} rotation={[0, facing, 0]}>
@@ -261,41 +326,21 @@ function SignalHead({ signal }) {
         <meshStandardMaterial color="#334155" metalness={0.35} roughness={0.6} />
       </mesh>
       <mesh position={[0.44, 5.9, 0]} castShadow>
-        <boxGeometry args={[1.18, 3.8, 1.04]} />
+        <boxGeometry args={[1.18, 3.1, 1.04]} />
         <meshStandardMaterial color="#0f172a" metalness={0.3} roughness={0.58} />
       </mesh>
-      <mesh position={[0.44, 6.82, 0.6]} castShadow>
+      <mesh position={[0.44, 6.52, 0.6]} castShadow>
         <sphereGeometry args={[0.24, 18, 18]} />
         <meshStandardMaterial color={redLight.color} emissive={redLight.emissive} emissiveIntensity={redLight.intensity} />
       </mesh>
-      <mesh position={[0.44, 5.9, 0.6]} castShadow>
+      <mesh position={[0.44, 5.6, 0.6]} castShadow>
         <sphereGeometry args={[0.24, 18, 18]} />
         <meshStandardMaterial color={yellowLight.color} emissive={yellowLight.emissive} emissiveIntensity={yellowLight.intensity} />
       </mesh>
-      <mesh position={[0.44, 4.98, 0.6]} castShadow>
+      <mesh position={[0.44, 4.68, 0.6]} castShadow>
         <sphereGeometry args={[0.24, 18, 18]} />
         <meshStandardMaterial color={greenLight.color} emissive={greenLight.emissive} emissiveIntensity={greenLight.intensity} />
       </mesh>
-      <mesh position={[0.44, 4.06, 0.02]} castShadow>
-        <boxGeometry args={[0.76, 0.5, 0.12]} />
-        <meshStandardMaterial
-          color={leftTurnActive ? "#22c55e" : "#162033"}
-          emissive={leftTurnActive ? "#22c55e" : "#020617"}
-          emissiveIntensity={leftTurnActive ? 1.5 : 0.08}
-          metalness={0.22}
-          roughness={0.42}
-        />
-      </mesh>
-      <Text
-        position={[0.44, 4.06, 0.1]}
-        rotation={[0, 0, 0]}
-        fontSize={0.28}
-        color={leftTurnActive ? "#ecfdf5" : "#334155"}
-        anchorX="center"
-        anchorY="middle"
-      >
-        L
-      </Text>
     </group>
   );
 }
@@ -337,32 +382,38 @@ function Crosswalk({ crosswalk, active }) {
 }
 
 function StopLine({ lanes }) {
-  const stopPoint = lanes.reduce(
+  const physicalLanes = uniquePhysicalLanes(lanes);
+  const stopPoint = physicalLanes.reduce(
     (accumulator, lane) => ({
       x: accumulator.x + lane.stop_line_position.x,
       y: accumulator.y + lane.stop_line_position.y,
     }),
     { x: 0, y: 0 },
   );
-  stopPoint.x /= lanes.length;
-  stopPoint.y /= lanes.length;
-  const vertical = lanes[0].approach === "NORTH" || lanes[0].approach === "SOUTH";
+  stopPoint.x /= physicalLanes.length;
+  stopPoint.y /= physicalLanes.length;
+  const vertical = physicalLanes[0].approach === "NORTH" || physicalLanes[0].approach === "SOUTH";
 
   return (
     <mesh position={[stopPoint.x, 0.032, stopPoint.y]} rotation={[-Math.PI / 2, 0, 0]}>
-      <planeGeometry args={vertical ? [lanes.length * LANE_WIDTH, 0.44] : [0.44, lanes.length * LANE_WIDTH]} />
+      <planeGeometry args={vertical ? [physicalLanes.length * LANE_WIDTH, 0.44] : [0.44, physicalLanes.length * LANE_WIDTH]} />
       <meshStandardMaterial color="#f8fafc" emissive="#ffffff" emissiveIntensity={0.12} />
     </mesh>
   );
 }
 
 function PathDebugLine({ lane }) {
-  const points = useMemo(() => lane.path.map((point) => [point.x, 0.08, point.y]), [lane.path]);
-  return <Line points={points} color={lane.movement === "LEFT" ? "#f59e0b" : "#7dd3fc"} transparent opacity={0.28} lineWidth={1.4} />;
+  const points = useMemo(() => laneDebugPoints(lane), [lane]);
+  const color = lane.movement === "RIGHT" ? "#f59e0b" : "#7dd3fc";
+  return <Line points={points} color={color} transparent opacity={0.28} lineWidth={1.4} />;
 }
 
-function RoadNetwork({ lanes, crosswalks, currentPhase, controllerStage, signals }) {
+function RoadNetwork({ lanes, crosswalks, pedestrians, signals }) {
   const stripes = useMemo(() => dividerSegments(), []);
+  const activeCrosswalkIds = useMemo(
+    () => new Set(pedestrians.filter((pedestrian) => pedestrian.state === "CROSSING").map((pedestrian) => pedestrian.crosswalk_id)),
+    [pedestrians],
+  );
   const lanesByApproach = lanes.reduce((groups, lane) => {
     groups[lane.approach] = groups[lane.approach] ?? [];
     groups[lane.approach].push(lane);
@@ -417,7 +468,7 @@ function RoadNetwork({ lanes, crosswalks, currentPhase, controllerStage, signals
         <Crosswalk
           key={crosswalk.id}
           crosswalk={crosswalk}
-          active={isCrosswalkActive(crosswalk, currentPhase, controllerStage)}
+          active={isCrosswalkActive(crosswalk, activeCrosswalkIds)}
         />
       ))}
 
@@ -505,7 +556,7 @@ function PedestrianActor({ id, sceneBufferRef, initial }) {
     }
 
     const elapsed = renderState.clock.getElapsedTime() + phaseOffsetRef.current;
-    const crossing = sampled.state === "CROSSING";
+    const crossing = sampled.state !== "WAITING";
     const swing = crossing ? Math.sin(elapsed * 8) * 0.4 : 0;
     const bob = crossing ? Math.sin(elapsed * 8) * 0.04 : 0;
 
@@ -528,7 +579,7 @@ function PedestrianActor({ id, sceneBufferRef, initial }) {
   }
 
   return (
-    <group ref={rootRef} position={[initial.x, 0, initial.y]} rotation={[0, pedestrianFacing(initial), 0]}>
+    <group ref={rootRef} position={[initial.x, 0, initial.y]} rotation={[0, pedestrianFacing(initial), 0]} scale={[initial.body_scale ?? 1, initial.body_scale ?? 1, initial.body_scale ?? 1]}>
       <mesh position={[0, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]} scale={[0.35, 0.5, 1]}>
         <circleGeometry args={[1, 18]} />
         <meshBasicMaterial color="#020617" transparent opacity={0.2} />
@@ -537,18 +588,18 @@ function PedestrianActor({ id, sceneBufferRef, initial }) {
         <group ref={leftLegRef} position={[-0.1, 0.32, 0]}>
           <mesh castShadow>
             <cylinderGeometry args={[0.06, 0.07, 0.5, 10]} />
-            <meshStandardMaterial color="#7c2d12" roughness={0.72} />
+            <meshStandardMaterial color={initial.pants_color ?? "#334155"} roughness={0.72} />
           </mesh>
         </group>
         <group ref={rightLegRef} position={[0.1, 0.32, 0]}>
           <mesh castShadow>
             <cylinderGeometry args={[0.06, 0.07, 0.5, 10]} />
-            <meshStandardMaterial color="#7c2d12" roughness={0.72} />
+            <meshStandardMaterial color={initial.pants_color ?? "#334155"} roughness={0.72} />
           </mesh>
         </group>
         <mesh position={[0, 0.86, 0]} castShadow>
           <capsuleGeometry args={[0.18, 0.48, 6, 10]} />
-          <meshStandardMaterial color={initial.state === "CROSSING" ? "#22c55e" : "#fb923c"} roughness={0.42} metalness={0.06} />
+          <meshStandardMaterial color={initial.shirt_color ?? "#fb923c"} roughness={0.42} metalness={0.06} />
         </mesh>
         <mesh position={[0, 1.44, 0]} castShadow>
           <sphereGeometry args={[0.18, 16, 16]} />
@@ -579,8 +630,7 @@ export default function SimulationCanvas({ sceneSnapshot, sceneBufferRef, camera
         <RoadNetwork
           lanes={sceneSnapshot.lanes}
           crosswalks={sceneSnapshot.crosswalks}
-          currentPhase={sceneSnapshot.current_state}
-          controllerStage={sceneSnapshot.controller_phase}
+          pedestrians={sceneSnapshot.pedestrians}
           signals={sceneSnapshot.signals}
         />
 

@@ -8,7 +8,7 @@ Responsibilities:
 - emergency preemption and green extension
 - stop-line enforcement before zebra crossings
 - protected pedestrian all-red phase
-- Bezier-based turning motion
+- analytical quarter-circle turning motion
 - live metrics and event generation
 
 Run validation:
