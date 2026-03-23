@@ -13,7 +13,7 @@ from typing import Any, Dict, Set
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 
@@ -30,6 +30,7 @@ VEHICLE_LABELS = {
     7: "truck",
 }
 POSITION_BUCKETS = ("left", "center", "right")
+JUNCTION_DIRECTIONS = ("north", "south", "east", "west")
 ACCIDENT_LABELS = {"car", "motorcycle", "bus", "truck", "ambulance"}
 ACCIDENT_IOU_THRESHOLD = 0.16
 ACCIDENT_CENTER_DISTANCE_FACTOR = 0.55
@@ -964,6 +965,131 @@ class SimulationRuntime:
         return merged_snapshot
 
 
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _compute_junction_priority(approaches: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Dict[str, Any]] = {}
+    active_directions: list[str] = []
+
+    for direction in JUNCTION_DIRECTIONS:
+        raw = approaches.get(direction, {}) if isinstance(approaches, dict) else {}
+        vehicle_count = _coerce_int(raw.get("vehicle_count"))
+        queue_length = _coerce_int(raw.get("queue_length"))
+        density_percent = _coerce_float(raw.get("density_percent"))
+        signal_priority_value = _coerce_int(raw.get("signal_priority_value"))
+        uncertain_count = _coerce_int(raw.get("uncertain_count"))
+        emergency_detected = bool(raw.get("emergency_detected"))
+        accident_detected = bool(raw.get("accident_detected"))
+        density_level = str(raw.get("density_level") or "low")
+
+        analyzed = any(
+            [
+                vehicle_count > 0,
+                queue_length > 0,
+                density_percent > 0.0,
+                signal_priority_value > 0,
+                emergency_detected,
+                accident_detected,
+                uncertain_count > 0,
+            ]
+        )
+        effective_priority = max(
+            0,
+            min(
+                100,
+                signal_priority_value
+                + (36 if emergency_detected else 0)
+                + (14 if accident_detected else 0)
+                + min(queue_length * 3, 18)
+                + min(int(density_percent * 0.18), 12)
+                - min(uncertain_count * 2, 10),
+            ),
+        )
+
+        normalized[direction] = {
+            "direction": direction,
+            "vehicle_count": vehicle_count,
+            "queue_length": queue_length,
+            "density_percent": round(density_percent, 2),
+            "density_level": density_level,
+            "signal_priority_value": signal_priority_value,
+            "effective_priority": effective_priority if analyzed else 0,
+            "emergency_detected": emergency_detected,
+            "accident_detected": accident_detected,
+            "uncertain_count": uncertain_count,
+            "status": "ready" if analyzed else "waiting",
+        }
+        if analyzed:
+            active_directions.append(direction)
+
+    if not active_directions:
+        return {
+            "ready": False,
+            "recommended_green_direction": None,
+            "signal_states": {direction: "red" for direction in JUNCTION_DIRECTIONS},
+            "cycle_plan": {"green_duration_sec": 0, "amber_duration_sec": 0, "all_red_duration_sec": 0},
+            "rationale": "Analyze at least one direction to recommend a safe junction phase plan.",
+            "approaches": normalized,
+        }
+
+    winner = max(
+        active_directions,
+        key=lambda direction: (
+            normalized[direction]["effective_priority"],
+            normalized[direction]["emergency_detected"],
+            normalized[direction]["queue_length"],
+            normalized[direction]["vehicle_count"],
+        ),
+    )
+    winner_data = normalized[winner]
+    green_duration_sec = min(
+        70,
+        max(
+            18,
+            18
+            + min(winner_data["queue_length"] * 4, 20)
+            + min(int(winner_data["density_percent"] * 0.22), 18)
+            + (14 if winner_data["emergency_detected"] else 0),
+        ),
+    )
+    amber_duration_sec = 4 if winner_data["density_level"] in {"medium", "high"} or winner_data["vehicle_count"] >= 6 else 3
+    all_red_duration_sec = 2
+
+    if winner_data["emergency_detected"]:
+        rationale = f"{winner.title()} approach has an emergency vehicle, so it should receive immediate green priority."
+    elif winner_data["accident_detected"]:
+        rationale = f"{winner.title()} approach shows accident risk, so traffic should clear that leg first while the other signals stay red."
+    elif winner_data["queue_length"] >= 4 or winner_data["density_level"] == "high":
+        rationale = f"{winner.title()} approach has the strongest queue pressure and density, so it should receive the next green phase."
+    else:
+        rationale = f"{winner.title()} approach currently has the highest balanced traffic demand and should receive green in the next cycle."
+
+    return {
+        "ready": True,
+        "recommended_green_direction": winner,
+        "signal_states": {direction: ("green" if direction == winner else "red") for direction in JUNCTION_DIRECTIONS},
+        "cycle_plan": {
+            "green_duration_sec": green_duration_sec,
+            "amber_duration_sec": amber_duration_sec,
+            "all_red_duration_sec": all_red_duration_sec,
+        },
+        "rationale": rationale,
+        "approaches": normalized,
+    }
+
+
 runtime = SimulationRuntime()
 vehicle_detector = VehicleDetector()
 
@@ -1017,6 +1143,12 @@ async def detect_vehicles(media: UploadFile = File(...)) -> Dict[str, Any]:
             dedupe_key="cv-emergency",
         )
     return result
+
+
+@app.post("/api/live-cv/junction/priority")
+async def compute_live_cv_junction_priority(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    approaches = payload.get("approaches", {}) if isinstance(payload, dict) else {}
+    return _compute_junction_priority(approaches if isinstance(approaches, dict) else {})
 
 
 @app.websocket("/ws")
