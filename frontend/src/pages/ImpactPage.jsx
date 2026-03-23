@@ -37,7 +37,7 @@ export default function ImpactPage({ snapshot }) {
         <div className="glass-panel rounded-[2rem] p-6">
           <p className="panel-title">Why It Matters</p>
           <div className="mt-4 space-y-4 text-sm leading-7 text-slate-300">
-            <p>Protected pedestrian phases cut risky vehicle-crosswalk overlap.</p>
+            <p>Synchronized crossing windows cut risky vehicle-crosswalk overlap.</p>
             <p>Emergency preemption reduces response delay where every second matters.</p>
             <p>Buffered realtime telemetry lowers operator fatigue by keeping motion smooth and readable.</p>
           </div>

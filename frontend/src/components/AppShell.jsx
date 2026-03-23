@@ -1,5 +1,9 @@
 import { NavLink } from "react-router-dom";
 
+function formatPhase(state) {
+  return String(state || "ALL_RED").split("_").join(" ");
+}
+
 const navItems = [
   { to: "/", label: "Home" },
   { to: "/simulation", label: "Simulation" },
@@ -16,8 +20,9 @@ export default function AppShell({ connectionState, snapshot, children }) {
           <p className="text-xs uppercase tracking-[0.34em] text-cyan-300">Urban Mobility Digital Twin</p>
           <h1 className="mt-3 text-4xl font-semibold tracking-tight text-white">Realtime Traffic Intelligence Platform</h1>
           <p className="mt-3 max-w-2xl text-sm leading-7 text-slate-300">
-            Single-direction adaptive signal phases, emergency preemption, protected pedestrian crossings, and a buffered 3D
-            render loop designed for smooth operator use.
+            Adaptive rule-based multi-phase control with a clean four-signal layout, protected straight and left movements,
+            straight-phase pedestrian release, lane-bound vehicle motion, and a buffered 3D render loop designed for stable
+            operator use.
           </p>
         </div>
 
@@ -43,7 +48,7 @@ export default function AppShell({ connectionState, snapshot, children }) {
           </div>
           <div className="rounded-3xl border border-white/10 bg-white/5 px-4 py-3 backdrop-blur-xl">
             <p className="metric-label">Active Phase</p>
-            <p className="mt-2 text-lg font-semibold text-white">{snapshot.active_direction ?? "PEDESTRIAN"}</p>
+            <p className="mt-2 text-lg font-semibold text-white">{formatPhase(snapshot.current_state)}</p>
           </div>
         </div>
       </header>

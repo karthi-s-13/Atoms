@@ -12,7 +12,7 @@ export default function DashboardPage({ snapshot, history }) {
       counts[vehicle.kind] = (counts[vehicle.kind] || 0) + 1;
       return counts;
     },
-    { car: 0, ambulance: 0, firetruck: 0, police: 0 },
+    { car: 0 },
   );
 
   return (
@@ -20,7 +20,7 @@ export default function DashboardPage({ snapshot, history }) {
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard label="Active Nodes" value={metrics.active_nodes} detail="signals + sensors" tone="cyan" />
         <MetricCard label="Detections" value={metrics.detections} detail="live events" tone="green" />
-        <MetricCard label="Emergency Stats" value={metrics.emergency_vehicles} detail="priority units" tone="amber" />
+        <MetricCard label="Active Cars" value={metrics.active_vehicles} detail="lane actors" tone="amber" />
         <MetricCard label="Savings" value={`${metrics.bandwidth_savings.toFixed(1)}%`} detail="telemetry efficiency" tone="rose" />
       </section>
 
@@ -29,12 +29,7 @@ export default function DashboardPage({ snapshot, history }) {
         <LineChart title="Queue Pressure" valueLabel="percent" points={history.queue} stroke="#f59e0b" />
         <DonutChart
           title="Vehicle Distribution"
-          items={[
-            { label: "Cars", value: distribution.car, color: "#38bdf8" },
-            { label: "Ambulance", value: distribution.ambulance, color: "#f8fafc" },
-            { label: "Firetruck", value: distribution.firetruck, color: "#ef4444" },
-            { label: "Police", value: distribution.police, color: "#60a5fa" },
-          ]}
+          items={[{ label: "Cars", value: distribution.car, color: "#3b82f6" }]}
         />
       </section>
 
@@ -51,9 +46,9 @@ export default function DashboardPage({ snapshot, history }) {
             <p className="mt-2 text-sm text-slate-400">Vehicles that completed intersection travel.</p>
           </div>
           <div className="glass-panel rounded-[2rem] p-5">
-            <p className="panel-title">Pedestrian Safety</p>
+            <p className="panel-title">Pedestrians</p>
             <p className="mt-3 text-3xl font-semibold text-white">{metrics.active_pedestrians}</p>
-            <p className="mt-2 text-sm text-slate-400">Currently protected crossing actors.</p>
+            <p className="mt-2 text-sm text-slate-400">Waiting at corners or crossing on a live zebra window.</p>
           </div>
         </div>
 

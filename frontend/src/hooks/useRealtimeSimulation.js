@@ -1,31 +1,88 @@
 import { startTransition, useEffect, useRef, useState } from "react";
 
+const APPROACHES = ["NORTH", "SOUTH", "EAST", "WEST"];
+const PHASES = ["NS_STRAIGHT", "NS_LEFT", "EW_STRAIGHT", "EW_LEFT"];
+
 const DEFAULT_CONFIG = {
   traffic_intensity: 1,
   ambulance_frequency: 0.08,
   ai_mode: "adaptive",
   speed_multiplier: 1,
   paused: false,
-  max_vehicles: 42,
-  max_pedestrians: 18,
+  max_vehicles: 36,
+  max_pedestrians: 12,
+};
+
+function defaultDirectionMetric(approach) {
+  return {
+    approach,
+    queue_length: 0,
+    avg_wait_time: 0,
+    flow_rate: 0,
+    queue_delta: 0,
+    congestion_trend: 0,
+    emergency_vehicles: 0,
+    alert_level: "normal",
+  };
+}
+
+function defaultPhaseScore(phase) {
+  return {
+    phase,
+    score: 0,
+    queue_component: 0,
+    wait_time_component: 0,
+    congestion_component: 0,
+    flow_component: 0,
+    fairness_boost: 0,
+    emergency_boost: 0,
+    queue_length: 0,
+    avg_wait_time: 0,
+    flow_rate: 0,
+    pedestrian_demand: 0,
+    demand_active: false,
+    recommended_hold: false,
+    decision_reason: "Awaiting telemetry.",
+  };
+}
+
+const DEFAULT_TRAFFIC_BRAIN = {
+  active_phase_score: 0,
+  top_phase: "NS_STRAIGHT",
+  strategy: "Awaiting telemetry.",
+  direction_metrics: Object.fromEntries(APPROACHES.map((approach) => [approach, defaultDirectionMetric(approach)])),
+  phase_scores: Object.fromEntries(PHASES.map((phase) => [phase, defaultPhaseScore(phase)])),
+  congestion_alerts: [],
+  emergency: {
+    detected: false,
+    preferred_phase: null,
+    approach: null,
+    vehicle_id: "",
+    eta_seconds: 0,
+    state: "idle",
+  },
 };
 
 const DEFAULT_SNAPSHOT = {
   frame: 0,
   timestamp: 0,
-  active_direction: "NORTH",
+  current_state: "NS_STRAIGHT",
+  active_direction: "NS",
+  controller_phase: "PHASE_GREEN",
+  phase_timer: 0,
+  phase_duration: 11.5,
+  min_green_remaining: 4.5,
   vehicles: [],
   pedestrians: [],
   lanes: [],
   crosswalks: [],
   signals: {
     NORTH: "GREEN",
-    SOUTH: "RED",
+    SOUTH: "GREEN",
     EAST: "RED",
     WEST: "RED",
-    PED: "RED",
   },
-  pedestrian_phase_active: false,
+  pedestrian_phase_active: true,
   metrics: {
     avg_wait_time: 0,
     throughput: 0,
@@ -39,6 +96,7 @@ const DEFAULT_SNAPSHOT = {
     detections: 0,
     bandwidth_savings: 0,
   },
+  traffic_brain: DEFAULT_TRAFFIC_BRAIN,
   events: [],
   config: DEFAULT_CONFIG,
 };
@@ -57,7 +115,39 @@ function normalizeSnapshot(snapshot) {
     events: Array.isArray(snapshot.events) ? snapshot.events : [],
     signals: { ...DEFAULT_SNAPSHOT.signals, ...(snapshot.signals ?? {}) },
     pedestrian_phase_active: Boolean(snapshot.pedestrian_phase_active),
+    phase_timer: Number.isFinite(snapshot.phase_timer) ? snapshot.phase_timer : DEFAULT_SNAPSHOT.phase_timer,
+    phase_duration: Number.isFinite(snapshot.phase_duration) ? snapshot.phase_duration : DEFAULT_SNAPSHOT.phase_duration,
+    min_green_remaining: Number.isFinite(snapshot.min_green_remaining) ? snapshot.min_green_remaining : DEFAULT_SNAPSHOT.min_green_remaining,
     metrics: { ...DEFAULT_SNAPSHOT.metrics, ...(snapshot.metrics ?? {}) },
+    traffic_brain: {
+      ...DEFAULT_TRAFFIC_BRAIN,
+      ...(snapshot.traffic_brain ?? {}),
+      direction_metrics: Object.fromEntries(
+        APPROACHES.map((approach) => [
+          approach,
+          {
+            ...defaultDirectionMetric(approach),
+            ...(snapshot.traffic_brain?.direction_metrics?.[approach] ?? {}),
+          },
+        ]),
+      ),
+      phase_scores: Object.fromEntries(
+        PHASES.map((phase) => [
+          phase,
+          {
+            ...defaultPhaseScore(phase),
+            ...(snapshot.traffic_brain?.phase_scores?.[phase] ?? {}),
+          },
+        ]),
+      ),
+      congestion_alerts: Array.isArray(snapshot.traffic_brain?.congestion_alerts)
+        ? snapshot.traffic_brain.congestion_alerts
+        : [],
+      emergency: {
+        ...DEFAULT_TRAFFIC_BRAIN.emergency,
+        ...(snapshot.traffic_brain?.emergency ?? {}),
+      },
+    },
     config: { ...DEFAULT_CONFIG, ...(snapshot.config ?? {}) },
   };
 }
@@ -193,6 +283,9 @@ export function useRealtimeSimulation() {
   const reset = () => {
     setHistory({ throughput: [], wait: [], queue: [], emergencies: [] });
     sceneBufferRef.current.frames = [makeBufferedFrame(DEFAULT_SNAPSHOT, performance.now())];
+    setSceneSnapshot(DEFAULT_SNAPSHOT);
+    setDashboardSnapshot(DEFAULT_SNAPSHOT);
+    setControls(DEFAULT_CONFIG);
     send({ type: "reset" });
   };
 

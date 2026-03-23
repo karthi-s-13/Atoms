@@ -42,10 +42,10 @@ def update_controls(engine: TrafficSimulationEngine) -> None:
 
         traffic_intensity = st.slider(
             "Traffic Intensity",
-            min_value=0.4,
-            max_value=3.0,
+            min_value=0.0,
+            max_value=1.0,
             value=float(engine.config.traffic_intensity),
-            step=0.1,
+            step=0.05,
         )
         max_vehicles = st.slider(
             "Max Vehicles",
@@ -104,7 +104,7 @@ def render(snapshot: Dict[str, object]) -> None:
     metrics = snapshot["metrics"]
     top = st.columns(5)
     top[0].metric("Frame", snapshot["frame"])
-    top[1].metric("Active Direction", snapshot["active_direction"] or "FALLBACK")
+    top[1].metric("Active Flow", snapshot["active_direction"] or "ALL RED")
     top[2].metric("Vehicles", metrics["active_vehicles"])
     top[3].metric("Pedestrians", metrics["active_pedestrians"])
     top[4].metric("Avg Wait", f"{metrics['avg_wait_time']:.2f}s")

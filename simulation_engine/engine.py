@@ -1,23 +1,32 @@
-"""Pure traffic simulation engine with single-direction phases and buffered motion data."""
+"""Protected multi-phase 4-way intersection simulation."""
 
 from __future__ import annotations
 
 import math
 import random
-from collections import defaultdict, deque
+import copy
+from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List
+from typing import Deque, Dict, Iterable, List
 
+from simulation_engine.traffic_brain import (
+    PedestrianTelemetryInput,
+    TrafficBrain,
+    VehicleTelemetryInput,
+)
 from shared.contracts import (
     Approach,
+    ControllerPhase,
     CrosswalkView,
     EventView,
+    LaneMovement,
     LaneView,
     MetricsView,
     PedestrianView,
     Point2D,
     RoadDirection,
     RouteType,
+    SignalCycleState,
     SignalState,
     SimulationConfig,
     SnapshotView,
@@ -25,85 +34,99 @@ from shared.contracts import (
     VehicleView,
 )
 
-
 FRAME_DT = 0.016
-PHASES: tuple[Approach, ...] = ("NORTH", "SOUTH", "EAST", "WEST")
+
 GREEN = "GREEN"
+GREEN_LEFT = "GREEN_LEFT"
 YELLOW = "YELLOW"
 RED = "RED"
-SAFE_DISTANCE = 7.0
-STOP_LINE_OFFSET = 5.0
-MIN_GREEN = 4.5
-MAX_GREEN = 11.0
-YELLOW_TIME = 1.6
-PEDESTRIAN_MIN = 4.2
-PEDESTRIAN_MAX = 10.0
-EMERGENCY_EXTENSION = 4.0
-DEADLOCK_TICK_LIMIT = 45
-EMERGENCY_GAP_FACTOR = 0.62
 
-INTERSECTION_ENTRY_POINTS: dict[Approach, Point2D] = {
-    "NORTH": Point2D(0.0, 8.0),
-    "SOUTH": Point2D(4.0, -8.0),
-    "EAST": Point2D(8.0, 0.0),
-    "WEST": Point2D(-8.0, -4.0),
-}
-OUTBOUND_START_POINTS: dict[Approach, Point2D] = {
-    "NORTH": Point2D(4.0, 8.0),
-    "SOUTH": Point2D(0.0, -8.0),
-    "EAST": Point2D(8.0, -4.0),
-    "WEST": Point2D(-8.0, 0.0),
-}
-OUTBOUND_END_POINTS: dict[Approach, Point2D] = {
-    "NORTH": Point2D(4.0, 72.0),
-    "SOUTH": Point2D(0.0, -72.0),
-    "EAST": Point2D(72.0, -4.0),
-    "WEST": Point2D(-72.0, 0.0),
-}
-OUTBOUND_DIRECTION_VECTORS: dict[Approach, Point2D] = {
-    "NORTH": Point2D(0.0, 1.0),
-    "SOUTH": Point2D(0.0, -1.0),
-    "EAST": Point2D(1.0, 0.0),
-    "WEST": Point2D(-1.0, 0.0),
-}
+PHASE_GREEN: ControllerPhase = "PHASE_GREEN"
+PHASE_YELLOW: ControllerPhase = "PHASE_YELLOW"
+PHASE_ALL_RED: ControllerPhase = "PHASE_ALL_RED"
 
-VEHICLE_COLORS: dict[VehicleKind, str] = {
-    "car": "#38bdf8",
-    "ambulance": "#f8fafc",
-    "firetruck": "#ef4444",
-    "police": "#60a5fa",
-}
-VEHICLE_PRIORITIES: dict[VehicleKind, int] = {
-    "car": 0,
-    "ambulance": 100,
-    "firetruck": 80,
-    "police": 60,
-}
-CRUISE_SPEEDS: dict[VehicleKind, float] = {
-    "car": 10.5,
-    "ambulance": 15.0,
-    "firetruck": 13.5,
-    "police": 14.2,
-}
+NS_STRAIGHT: SignalCycleState = "NS_STRAIGHT"
+EW_STRAIGHT: SignalCycleState = "EW_STRAIGHT"
+NS_LEFT: SignalCycleState = "NS_LEFT"
+EW_LEFT: SignalCycleState = "EW_LEFT"
 
-STRAIGHT_EXIT: dict[Approach, Approach] = {
-    "NORTH": "SOUTH",
-    "SOUTH": "NORTH",
-    "EAST": "WEST",
-    "WEST": "EAST",
-}
-LEFT_EXIT: dict[Approach, Approach] = {
-    "NORTH": "EAST",
-    "SOUTH": "WEST",
-    "EAST": "NORTH",
-    "WEST": "SOUTH",
-}
-RIGHT_EXIT: dict[Approach, Approach] = {
-    "NORTH": "WEST",
-    "SOUTH": "EAST",
-    "EAST": "SOUTH",
-    "WEST": "NORTH",
-}
+STRAIGHT_MIN_GREEN = 4.5
+STRAIGHT_MAX_GREEN = 11.5
+LEFT_MIN_GREEN = 3.0
+LEFT_MAX_GREEN = 7.5
+YELLOW_TIME = 2.0
+ALL_RED_TIME = 1.0
+ALL_RED_EXTENSION_STEP = 0.5
+ALL_RED_EXTENSION_LIMIT = 2.0
+
+QUEUE_WEIGHT = 1.0
+WAIT_TIME_BOOST_FACTOR = 0.35
+PEDESTRIAN_WEIGHT = 1.2
+PEDESTRIAN_WAIT_BOOST_FACTOR = 0.3
+SWITCH_SCORE_MARGIN = 0.75
+STARVATION_LIMIT = 18.0
+
+LEFT_TURN_PROBABILITY = 0.28
+EMERGENCY_ROUTE_PREFERENCE = 0.85
+EMERGENCY_SPEED_MULTIPLIER = 1.12
+
+SIGNAL_DIRECTIONS: tuple[Approach, ...] = ("NORTH", "SOUTH", "EAST", "WEST")
+
+ROAD_EXTENT = 72.0
+LANE_WIDTH = 3.5
+LANES_PER_DIRECTION = 2
+INNER_LANE_OFFSET = LANE_WIDTH / 2.0
+OUTER_LANE_OFFSET = INNER_LANE_OFFSET + LANE_WIDTH
+SHOULDER = 0.75
+ROAD_HALF_WIDTH = LANE_WIDTH * LANES_PER_DIRECTION
+ROAD_SURFACE_HALF_WIDTH = ROAD_HALF_WIDTH + SHOULDER
+INTERSECTION_SIZE = 14.0
+INTERSECTION_HALF_SIZE = INTERSECTION_SIZE / 2.0
+STOP_OFFSET = INTERSECTION_HALF_SIZE + 3.0
+CROSSWALK_INNER_OFFSET = INTERSECTION_HALF_SIZE + 0.4
+CROSSWALK_OUTER_OFFSET = STOP_OFFSET - 0.9
+CROSSWALK_CENTER_OFFSET = (CROSSWALK_INNER_OFFSET + CROSSWALK_OUTER_OFFSET) / 2.0
+CROSSWALK_DEPTH = CROSSWALK_OUTER_OFFSET - CROSSWALK_INNER_OFFSET
+PATH_ENTRY_OFFSET = ROAD_EXTENT
+PATH_EXIT_OFFSET = ROAD_EXTENT
+
+VEHICLE_MIN_LENGTH = 4.2
+VEHICLE_MAX_LENGTH = 4.8
+VEHICLE_MIN_WIDTH = 1.85
+VEHICLE_MAX_WIDTH = 2.1
+STRAIGHT_SPEED_MIN = 9.0
+STRAIGHT_SPEED_MAX = 11.0
+LEFT_SPEED_MIN = 7.2
+LEFT_SPEED_MAX = 8.4
+ACCELERATION = 8.0
+BRAKE_RATE = 16.0
+FOLLOW_GAP = 2.2
+FOLLOW_RESPONSE_DISTANCE = 16.0
+STOP_LINE_BUFFER = 0.25
+MIN_MOVEMENT_STEP = 1e-3
+YELLOW_REACTION_BUFFER = 0.9
+YELLOW_MIN_COMMIT_SPEED = 1.25
+YELLOW_COMMIT_WINDOW = 0.85
+
+PEDESTRIAN_SPEED = 2.0
+PEDESTRIAN_SNAP_DISTANCE = 0.05
+
+VEHICLE_COLOR_POOL = ("#3b82f6", "#ef4444", "#facc15", "#22c55e", "#f8fafc")
+VEHICLE_APPROACHES: tuple[Approach, ...] = ("SOUTH", "WEST", "NORTH", "EAST")
+PEDESTRIAN_SPAWN_PLAN: tuple[tuple[str, bool], ...] = (
+    ("north_crosswalk", False),
+    ("north_crosswalk", True),
+    ("east_crosswalk", False),
+    ("east_crosswalk", True),
+    ("south_crosswalk", False),
+    ("south_crosswalk", True),
+    ("west_crosswalk", False),
+    ("west_crosswalk", True),
+)
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
 
 
 def _lerp(a: float, b: float, t: float) -> float:
@@ -119,98 +142,90 @@ def _normalize(dx: float, dy: float) -> Point2D:
     return Point2D(dx / magnitude, dy / magnitude)
 
 
-def _advance_point(point: Point2D, direction: Point2D, distance: float) -> Point2D:
-    return Point2D(point.x + (direction.x * distance), point.y + (direction.y * distance))
+def _move_toward(current: float, target: float, max_delta: float) -> float:
+    if current < target:
+        return min(current + max_delta, target)
+    return max(current - max_delta, target)
 
 
-def _project_to_segment(point: Point2D, start: Point2D, end: Point2D) -> Point2D:
-    dx = end.x - start.x
-    dy = end.y - start.y
-    segment_length_sq = (dx * dx) + (dy * dy)
-    if segment_length_sq <= 1e-9:
-        return Point2D(start.x, start.y)
-    projection = (((point.x - start.x) * dx) + ((point.y - start.y) * dy)) / segment_length_sq
-    projection = max(0.0, min(1.0, projection))
-    return Point2D(start.x + (dx * projection), start.y + (dy * projection))
+def _direction_group(approach: Approach) -> RoadDirection:
+    return "NS" if approach in {"NORTH", "SOUTH"} else "EW"
 
 
-def _distance_along_segment(point: Point2D, start: Point2D, end: Point2D) -> float:
-    projected = _project_to_segment(point, start, end)
-    return _distance(start, projected)
+def _sample_quadratic_bezier(
+    start: Point2D,
+    control: Point2D,
+    end: Point2D,
+    *,
+    steps: int = 24,
+) -> List[Point2D]:
+    samples: List[Point2D] = []
+    for index in range(steps + 1):
+        t = index / steps
+        one_minus = 1.0 - t
+        samples.append(
+            Point2D(
+                x=((one_minus**2) * start.x) + (2.0 * one_minus * t * control.x) + ((t**2) * end.x),
+                y=((one_minus**2) * start.y) + (2.0 * one_minus * t * control.y) + ((t**2) * end.y),
+            )
+        )
+    return samples
 
 
-@dataclass
-class BezierPath:
-    start: Point2D
-    control: Point2D
-    end: Point2D
+@dataclass(frozen=True)
+class PolylinePath:
+    points: tuple[Point2D, ...]
+    cumulative_lengths: tuple[float, ...]
     length: float
 
     @classmethod
-    def from_points(cls, start: Point2D, control: Point2D, end: Point2D) -> "BezierPath":
-        samples = [cls._point(start, control, end, step / 32.0) for step in range(33)]
-        total = 0.0
-        for current, nxt in zip(samples, samples[1:]):
-            total += math.hypot(nxt.x - current.x, nxt.y - current.y)
-        return cls(start=start, control=control, end=end, length=max(total, 1.0))
+    def from_points(cls, points: Iterable[Point2D]) -> "PolylinePath":
+        filtered: List[Point2D] = []
+        for point in points:
+            if not filtered or _distance(filtered[-1], point) > 1e-6:
+                filtered.append(point)
+        if len(filtered) < 2:
+            raise ValueError("A path requires at least two distinct points.")
+        cumulative = [0.0]
+        travelled = 0.0
+        for start, end in zip(filtered, filtered[1:]):
+            travelled += _distance(start, end)
+            cumulative.append(travelled)
+        return cls(points=tuple(filtered), cumulative_lengths=tuple(cumulative), length=max(travelled, 1e-6))
 
-    @staticmethod
-    def _point(start: Point2D, control: Point2D, end: Point2D, t: float) -> Point2D:
-        one_minus = 1.0 - t
-        return Point2D(
-            x=(one_minus * one_minus * start.x) + (2 * one_minus * t * control.x) + (t * t * end.x),
-            y=(one_minus * one_minus * start.y) + (2 * one_minus * t * control.y) + (t * t * end.y),
-        )
+    def point_at_distance(self, distance_along: float) -> Point2D:
+        target = _clamp(distance_along, 0.0, self.length)
+        for index in range(len(self.points) - 1):
+            segment_start = self.cumulative_lengths[index]
+            segment_end = self.cumulative_lengths[index + 1]
+            if target <= segment_end or index == len(self.points) - 2:
+                span = max(segment_end - segment_start, 1e-6)
+                ratio = (target - segment_start) / span
+                start = self.points[index]
+                end = self.points[index + 1]
+                return Point2D(x=_lerp(start.x, end.x, ratio), y=_lerp(start.y, end.y, ratio))
+        return self.points[-1]
 
-    def point_at(self, progress: float) -> Point2D:
-        return self._point(self.start, self.control, self.end, max(0.0, min(1.0, progress)))
+    def point_at(self, t: float) -> Point2D:
+        return self.point_at_distance(self.length * _clamp(t, 0.0, 1.0))
 
-    def tangent_at(self, progress: float) -> Point2D:
-        t = max(0.0, min(1.0, progress))
-        one_minus = 1.0 - t
-        return Point2D(
-            x=(2 * one_minus * (self.control.x - self.start.x)) + (2 * t * (self.end.x - self.control.x)),
-            y=(2 * one_minus * (self.control.y - self.start.y)) + (2 * t * (self.end.y - self.control.y)),
-        )
+    def tangent_at_distance(self, distance_along: float) -> Point2D:
+        target = _clamp(distance_along, 0.0, self.length)
+        for index in range(len(self.points) - 1):
+            segment_end = self.cumulative_lengths[index + 1]
+            if target <= segment_end or index == len(self.points) - 2:
+                start = self.points[index]
+                end = self.points[index + 1]
+                return _normalize(end.x - start.x, end.y - start.y)
+        start = self.points[-2]
+        end = self.points[-1]
+        return _normalize(end.x - start.x, end.y - start.y)
 
-    def nearest_progress(self, point: Point2D) -> float:
-        best_progress = 0.0
-        best_distance = float("inf")
-        for step in range(65):
-            progress = step / 64.0
-            sample = self.point_at(progress)
-            distance = math.hypot(sample.x - point.x, sample.y - point.y)
-            if distance < best_distance:
-                best_distance = distance
-                best_progress = progress
-        return best_progress
-
-
-@dataclass
-class LaneDefinition:
-    id: str
-    approach: Approach
-    start: Point2D
-    end: Point2D
-    crosswalk_id: str
-    stop_line_position: Point2D
-    direction_vector: Point2D
-    entry_point: Point2D
-    stop_distance: float
-    entry_distance: float
-
-    def to_view(self) -> LaneView:
-        return LaneView(
-            id=self.id,
-            approach=self.approach,
-            start=self.start,
-            end=self.end,
-            crosswalk_id=self.crosswalk_id,
-            stop_line_position=self.stop_line_position,
-        )
+    def tangent_at(self, t: float) -> Point2D:
+        return self.tangent_at_distance(self.length * _clamp(t, 0.0, 1.0))
 
 
-@dataclass
+@dataclass(frozen=True)
 class CrosswalkDefinition:
     id: str
     road_direction: RoadDirection
@@ -219,14 +234,8 @@ class CrosswalkDefinition:
     movement: Point2D
 
     @property
-    def length(self) -> float:
-        return math.hypot(self.end.x - self.start.x, self.end.y - self.start.y)
-
-    def point_at(self, progress: float) -> Point2D:
-        return Point2D(
-            x=_lerp(self.start.x, self.end.x, max(0.0, min(1.0, progress))),
-            y=_lerp(self.start.y, self.end.y, max(0.0, min(1.0, progress))),
-        )
+    def movement_direction(self) -> RoadDirection:
+        return "EW" if abs(self.movement.x) > abs(self.movement.y) else "NS"
 
     def to_view(self) -> CrosswalkView:
         return CrosswalkView(
@@ -238,142 +247,407 @@ class CrosswalkDefinition:
         )
 
 
+@dataclass(frozen=True)
+class LaneDefinition:
+    id: str
+    direction: Approach
+    lane_index: str
+    movement: LaneMovement
+    movement_id: str
+    direction_group: RoadDirection
+    path: PolylinePath
+    stop_line_position: Point2D
+    stop_distance: float
+    stop_crosswalk_id: str
+    crosswalk_start: Point2D
+
+    def to_view(self) -> LaneView:
+        return LaneView(
+            id=self.id,
+            kind="main",
+            approach=self.direction,
+            direction=self.direction,
+            movement=self.movement,
+            start=self.path.points[0],
+            end=self.path.points[-1],
+            path=list(self.path.points),
+            crosswalk_id=self.stop_crosswalk_id,
+            stop_line_position=self.stop_line_position,
+            crosswalk_start=self.crosswalk_start,
+        )
+
+
 @dataclass
-class VehicleState:
+class VehicleStateModel:
     id: str
     lane_id: str
-    approach: Approach
     route: RouteType
-    path: BezierPath
-    stop_progress: float
     progress: float
     speed: float
-    cruise_speed: float
-    kind: VehicleKind
-    has_siren: bool
-    priority: int
     state: str
-    wait_time: float
-    color: str
     position: Point2D
-    direction_vector: Point2D
-    entry_point: Point2D
-    exit_point: Point2D
-    exit_end: Point2D
-    exit_direction_vector: Point2D
-    stop_distance: float
-    approach_length: float
-    turn_length: float
-    exit_length: float
-    total_length: float
-    approach_distance: float = 0.0
-    turn_distance: float = 0.0
-    exit_distance: float = 0.0
-    segment: str = "APPROACH"
-    heading: float = 0.0
-    velocity_x: float = 0.0
-    velocity_y: float = 0.0
+    heading: float
+    velocity_x: float
+    velocity_y: float
+    wait_time: float
+    cruise_speed: float
+    color: str
+    distance_along: float
+    kind: VehicleKind = "car"
+    has_siren: bool = False
+    priority: int = 0
+    length: float = VEHICLE_MIN_LENGTH
+    width: float = VEHICLE_MIN_WIDTH
 
 
 @dataclass
 class PedestrianStateModel:
     id: str
+    crossing: RoadDirection
     crosswalk_id: str
     road_direction: RoadDirection
+    start_position: Point2D
+    target_position: Point2D
+    position: Point2D
     progress: float
     speed: float
-    wait_time: float
     state: str = "WAITING"
     velocity_x: float = 0.0
     velocity_y: float = 0.0
+    wait_time: float = 0.0
+    target_crosswalk: str = ""
+    is_elderly: bool = False
+    is_impatient: bool = False
+    risky_crossing: bool = False
+    look_angle: float = 0.0
+
+
+@dataclass(frozen=True)
+class PhaseDefinition:
+    name: SignalCycleState
+    min_green: float
+    max_green: float
+    direction_group: RoadDirection | None
+    movement_ids: tuple[str, ...]
+    pedestrian_crossing: RoadDirection | None = None
+
+
+PHASE_ORDER: tuple[SignalCycleState, ...] = (
+    NS_STRAIGHT,
+    NS_LEFT,
+    EW_STRAIGHT,
+    EW_LEFT,
+)
+
+PHASE_DEFINITIONS: Dict[SignalCycleState, PhaseDefinition] = {
+    NS_STRAIGHT: PhaseDefinition(NS_STRAIGHT, STRAIGHT_MIN_GREEN, STRAIGHT_MAX_GREEN, "NS", ("N_STRAIGHT", "S_STRAIGHT"), pedestrian_crossing="EW"),
+    NS_LEFT: PhaseDefinition(NS_LEFT, LEFT_MIN_GREEN, LEFT_MAX_GREEN, "NS", ("N_LEFT", "S_LEFT")),
+    EW_STRAIGHT: PhaseDefinition(EW_STRAIGHT, STRAIGHT_MIN_GREEN, STRAIGHT_MAX_GREEN, "EW", ("E_STRAIGHT", "W_STRAIGHT"), pedestrian_crossing="NS"),
+    EW_LEFT: PhaseDefinition(EW_LEFT, LEFT_MIN_GREEN, LEFT_MAX_GREEN, "EW", ("E_LEFT", "W_LEFT")),
+}
+
+
+class SignalController:
+    """Adaptive protected multi-phase controller with hysteresis and starvation guards."""
+
+    def __init__(self) -> None:
+        self.current_phase_name: SignalCycleState = NS_STRAIGHT
+        self.next_phase_name: SignalCycleState = NS_STRAIGHT
+        self.stage: ControllerPhase = PHASE_GREEN
+        self.stage_elapsed = 0.0
+        self.all_red_release_time = ALL_RED_TIME
+        self.unserved_demand_time: Dict[SignalCycleState, float] = {phase: 0.0 for phase in PHASE_ORDER}
+
+    @property
+    def current_phase(self) -> PhaseDefinition:
+        return PHASE_DEFINITIONS[self.current_phase_name]
+
+    @property
+    def state(self) -> SignalCycleState:
+        return self.current_phase_name
+
+    def stage_duration(self) -> float:
+        if self.stage == PHASE_GREEN:
+            return self.current_phase.max_green
+        if self.stage == PHASE_YELLOW:
+            return YELLOW_TIME
+        return self.all_red_release_time
+
+    def phase_timer(self) -> float:
+        return self.stage_elapsed
+
+    def phase_time_remaining(self) -> float:
+        return max(0.0, self.stage_duration() - self.stage_elapsed)
+
+    def min_green_remaining(self) -> float:
+        if self.stage != PHASE_GREEN:
+            return 0.0
+        return max(0.0, self.current_phase.min_green - self.stage_elapsed)
+
+    def _update_unserved_demand(self, dt: float, phase_has_demand: Dict[SignalCycleState, bool]) -> None:
+        for phase in PHASE_ORDER:
+            if phase == self.current_phase_name and self.stage == PHASE_GREEN:
+                self.unserved_demand_time[phase] = 0.0
+            elif phase_has_demand.get(phase, False):
+                self.unserved_demand_time[phase] += dt
+            else:
+                self.unserved_demand_time[phase] = 0.0
+
+    def _highest_scoring_phase(
+        self,
+        phase_scores: Dict[SignalCycleState, float],
+        phase_has_demand: Dict[SignalCycleState, bool],
+        *,
+        exclude_current: bool = False,
+    ) -> SignalCycleState:
+        candidates = [
+            phase
+            for phase in PHASE_ORDER
+            if phase_has_demand.get(phase, False) and not (exclude_current and phase == self.current_phase_name)
+        ]
+        if not candidates:
+            return self.current_phase_name
+
+        highest_score = max(phase_scores.get(phase, 0.0) for phase in candidates)
+        top = [phase for phase in candidates if abs(phase_scores.get(phase, 0.0) - highest_score) < 1e-6]
+        if not exclude_current and self.current_phase_name in top:
+            return self.current_phase_name
+        return min(top, key=PHASE_ORDER.index)
+
+    def _starved_phase(
+        self,
+        phase_scores: Dict[SignalCycleState, float],
+        phase_has_demand: Dict[SignalCycleState, bool],
+    ) -> SignalCycleState | None:
+        starved = [
+            phase
+            for phase in PHASE_ORDER
+            if phase_has_demand.get(phase, False) and self.unserved_demand_time.get(phase, 0.0) >= STARVATION_LIMIT
+        ]
+        if not starved:
+            return None
+        return max(starved, key=lambda phase: (self.unserved_demand_time[phase], phase_scores.get(phase, 0.0)))
+
+    def _should_switch_phase(
+        self,
+        phase_scores: Dict[SignalCycleState, float],
+        phase_has_demand: Dict[SignalCycleState, bool],
+    ) -> SignalCycleState | None:
+        if self.stage_elapsed < self.current_phase.min_green:
+            return None
+
+        current_score = phase_scores.get(self.current_phase_name, 0.0)
+        current_has_demand = phase_has_demand.get(self.current_phase_name, False)
+        competing_demand = any(phase_has_demand.get(phase, False) for phase in PHASE_ORDER if phase != self.current_phase_name)
+
+        starved = self._starved_phase(phase_scores, phase_has_demand)
+        if starved is not None and starved != self.current_phase_name:
+            return starved
+
+        if self.stage_elapsed >= self.current_phase.max_green and competing_demand:
+            return self._highest_scoring_phase(phase_scores, phase_has_demand, exclude_current=True)
+
+        if not current_has_demand:
+            candidate = self._highest_scoring_phase(phase_scores, phase_has_demand, exclude_current=True)
+            return candidate if candidate != self.current_phase_name else None
+
+        candidate = self._highest_scoring_phase(phase_scores, phase_has_demand)
+        candidate_score = phase_scores.get(candidate, 0.0)
+        if candidate != self.current_phase_name and candidate_score > current_score + SWITCH_SCORE_MARGIN:
+            return candidate
+
+        return None
+
+    def update(
+        self,
+        dt: float,
+        phase_scores: Dict[SignalCycleState, float],
+        phase_has_demand: Dict[SignalCycleState, bool],
+        *,
+        intersection_clear: bool,
+    ) -> list[tuple[SignalCycleState, ControllerPhase]]:
+        transitions: list[tuple[SignalCycleState, ControllerPhase]] = []
+        self._update_unserved_demand(dt, phase_has_demand)
+        self.stage_elapsed += dt
+
+        while True:
+            # Every change must clear through green -> yellow -> all-red before the next phase goes green.
+            if self.stage == PHASE_GREEN:
+                next_phase = self._should_switch_phase(phase_scores, phase_has_demand)
+                if next_phase is None:
+                    break
+                self.next_phase_name = next_phase
+                self.stage = PHASE_YELLOW
+                self.stage_elapsed = 0.0
+                transitions.append((self.current_phase_name, self.stage))
+                break
+
+            if self.stage == PHASE_YELLOW:
+                if self.stage_elapsed < YELLOW_TIME:
+                    break
+
+                self.stage = PHASE_ALL_RED
+                self.stage_elapsed = 0.0
+                self.all_red_release_time = ALL_RED_TIME
+                transitions.append((self.current_phase_name, self.stage))
+                continue
+
+            if self.stage == PHASE_ALL_RED:
+                if self.stage_elapsed < ALL_RED_TIME:
+                    break
+
+                if not intersection_clear and self.all_red_release_time < ALL_RED_TIME + ALL_RED_EXTENSION_LIMIT:
+                    self.all_red_release_time = min(
+                        self.all_red_release_time + ALL_RED_EXTENSION_STEP,
+                        ALL_RED_TIME + ALL_RED_EXTENSION_LIMIT,
+                    )
+                    break
+
+                if self.stage_elapsed < self.all_red_release_time:
+                    break
+
+                self.current_phase_name = self.next_phase_name
+                self.stage = PHASE_GREEN
+                self.stage_elapsed = 0.0
+                self.all_red_release_time = ALL_RED_TIME
+                transitions.append((self.current_phase_name, self.stage))
+                continue
+
+            break
+        return transitions
+
+    def controller_phase(self) -> ControllerPhase:
+        return self.stage
+
+    def active_direction(self) -> RoadDirection | None:
+        if self.stage == PHASE_ALL_RED:
+            return None
+        return self.current_phase.direction_group
+
+    def signal_state_for_approach(self, approach: Approach) -> SignalState:
+        phase = self.current_phase
+        if phase.direction_group != _direction_group(approach):
+            return RED
+        if self.stage == PHASE_ALL_RED:
+            return RED
+        if self.stage == PHASE_YELLOW:
+            return YELLOW
+        if phase.name in {NS_LEFT, EW_LEFT}:
+            return GREEN_LEFT
+        return GREEN
+
+    def can_vehicle_move(self, approach: Approach, route: RouteType) -> bool:
+        signal_state = self.signal_state_for_approach(approach)
+        if route == "straight":
+            return signal_state == GREEN
+        if route == "left":
+            return signal_state == GREEN_LEFT
+        return False
+
+    def pedestrians_can_cross(self, crossing: RoadDirection) -> bool:
+        return self.stage == PHASE_GREEN and self.current_phase.pedestrian_crossing == crossing
 
 
 class TrafficSimulationEngine:
-    """Pure logic engine for a four-way signalized intersection."""
+    """Protected multi-phase intersection with straight and left intents."""
 
     def __init__(self) -> None:
-        self.random = random.Random(24)
-        self.config = SimulationConfig()
         self.crosswalks = self._build_crosswalks()
         self.lanes = self._build_lanes()
-        self.spawn_accumulators: Dict[Approach, float] = defaultdict(float)
-        self.pedestrian_spawn_accumulator = 0.0
-        self.frame = 0
-        self.time = 0.0
-        self.active_direction: Approach | None = "NORTH"
-        self.next_direction: Approach | str | None = None
-        self.phase_state: str = GREEN
-        self.phase_elapsed = 0.0
-        self.pedestrian_phase_active = False
-        self.processed_vehicles = 0
-        self.smoothed_throughput = 0.0
-        self.vehicles: List[VehicleState] = []
-        self.pedestrians: List[PedestrianStateModel] = []
+        self.phase_lane_ids = {
+            phase: tuple(
+                lane_id for lane_id, lane in self.lanes.items() if lane.movement_id in definition.movement_ids
+            )
+            for phase, definition in PHASE_DEFINITIONS.items()
+        }
+        self.lane_phase_map = {
+            lane_id: phase
+            for phase, lane_ids in self.phase_lane_ids.items()
+            for lane_id in lane_ids
+        }
+        self.vehicle_lane_order = list(self.lanes.keys())
+        self._rng = random.Random(13)
         self.events: Deque[EventView] = deque(maxlen=40)
-        self._vehicle_index = 0
-        self._pedestrian_index = 0
-        self.ticks_without_movement = 0
-        self.vehicles_moved_last_tick = 0
-        self.metrics = MetricsView(0.0, 0.0, 0, 0.0, 0, 0, 0, 0, 12, 0, 0.0)
-        self._log("INFO", "Production traffic engine initialized.")
+        self.traffic_brain = TrafficBrain()
+        self.reset()
+        self._log("INFO", "Multi-phase intersection initialized with grouped signals, protected straight phases, and safe left turns.")
 
     def reset(self) -> None:
-        self.spawn_accumulators = defaultdict(float)
-        self.pedestrian_spawn_accumulator = 0.0
+        self.config = SimulationConfig(ai_mode="adaptive", max_vehicles=36, max_pedestrians=12)
+        self.signal_controller = SignalController()
+        self.current_state: SignalCycleState = self.signal_controller.state
         self.frame = 0
         self.time = 0.0
-        self.active_direction = "NORTH"
-        self.next_direction = None
-        self.phase_state = GREEN
-        self.phase_elapsed = 0.0
-        self.pedestrian_phase_active = False
         self.processed_vehicles = 0
         self.smoothed_throughput = 0.0
-        self.vehicles = []
-        self.pedestrians = []
+        self.vehicles: List[VehicleStateModel] = []
+        self.pedestrians: List[PedestrianStateModel] = []
+        self.metrics = MetricsView(0.0, 0.0, 0, 0.0, 0, 0, 0, 0, 12, 0, 12.0)
         self._vehicle_index = 0
         self._pedestrian_index = 0
+        self._vehicle_spawn_cursor = 0
+        self._pedestrian_spawn_cursor = 0
+        self._vehicle_spawn_timer = self._vehicle_spawn_interval()
+        self._pedestrian_spawn_timer = self._pedestrian_spawn_interval()
+        self._color_cursor = 0
+        self._vehicles_processed_last_tick = 0
+        self._vehicles_processed_by_approach_last_tick: Dict[Approach, int] = {
+            approach: 0 for approach in SIGNAL_DIRECTIONS
+        }
+        self.traffic_brain.reset()
+        self.phase_scores: Dict[SignalCycleState, float] = {phase: 0.0 for phase in PHASE_ORDER}
+        self.phase_has_demand: Dict[SignalCycleState, bool] = {phase: False for phase in PHASE_ORDER}
+        self.phase_demands: Dict[SignalCycleState, Dict[str, float]] = {
+            phase: {
+                "queue": 0.0,
+                "wait_time": 0.0,
+                "pedestrian_demand": 0.0,
+                "flow_rate": 0.0,
+                "congestion_trend": 0.0,
+                "fairness_boost": 0.0,
+                "emergency_boost": 0.0,
+                "score": 0.0,
+            }
+            for phase in PHASE_ORDER
+        }
         self.events.clear()
-        self.ticks_without_movement = 0
-        self.vehicles_moved_last_tick = 0
-        self.metrics = MetricsView(0.0, 0.0, 0, 0.0, 0, 0, 0, 0, 12, 0, 0.0)
-        self._log("INFO", "Simulation reset.")
+        self._refresh_phase_demand_cache(0.0)
 
     def update_config(self, values: Dict[str, object]) -> SimulationConfig:
         if "traffic_intensity" in values:
-            self.config.traffic_intensity = max(0.2, min(3.5, float(values["traffic_intensity"])))
+            self.config.traffic_intensity = _clamp(float(values["traffic_intensity"]), 0.0, 1.0)
         if "ambulance_frequency" in values:
-            self.config.ambulance_frequency = max(0.0, min(1.0, float(values["ambulance_frequency"])))
+            self.config.ambulance_frequency = _clamp(float(values["ambulance_frequency"]), 0.0, 1.0)
         if "speed_multiplier" in values:
-            self.config.speed_multiplier = max(0.25, min(4.0, float(values["speed_multiplier"])))
+            self.config.speed_multiplier = _clamp(float(values["speed_multiplier"]), 0.25, 4.0)
         if "paused" in values:
             self.config.paused = bool(values["paused"])
         if "max_vehicles" in values:
-            self.config.max_vehicles = max(8, min(120, int(values["max_vehicles"])))
+            self.config.max_vehicles = max(0, min(80, int(values["max_vehicles"])))
         if "max_pedestrians" in values:
-            self.config.max_pedestrians = max(2, min(60, int(values["max_pedestrians"])))
+            self.config.max_pedestrians = max(0, min(40, int(values["max_pedestrians"])))
         if "ai_mode" in values:
-            mode = str(values["ai_mode"]).strip().lower()
-            self.config.ai_mode = "fixed" if mode == "fixed" else "emergency" if mode == "emergency" else "adaptive"
+            self.config.ai_mode = "adaptive"
         return self.config
 
     def tick(self, dt: float = FRAME_DT) -> Dict[str, object]:
-        sim_dt = max(FRAME_DT, float(dt))
+        sim_dt = max(0.0, float(dt))
         if self.config.paused:
             sim_dt = 0.0
         else:
             sim_dt *= self.config.speed_multiplier
 
         self.frame += 1
+        self._vehicles_processed_last_tick = 0
+        self._vehicles_processed_by_approach_last_tick = {
+            approach: 0 for approach in SIGNAL_DIRECTIONS
+        }
         if sim_dt > 0.0:
-            self._ensure_live_phase()
             self.time += sim_dt
             self.update_signals(sim_dt)
-            self.spawn_vehicles(sim_dt)
             self.update_vehicles(sim_dt)
             self.update_pedestrians(sim_dt)
-            if not self.vehicles:
-                self.vehicles.append(self._make_vehicle(self.active_direction or "NORTH"))
+        self._refresh_phase_demand_cache(sim_dt)
         self.compute_metrics(sim_dt)
         return self.snapshot().to_dict()
 
@@ -384,14 +658,20 @@ class TrafficSimulationEngine:
         return SnapshotView(
             frame=self.frame,
             timestamp=round(self.time, 3),
-            active_direction=self.active_direction,
+            current_state=self.current_state,
+            active_direction=self.signal_controller.active_direction(),
+            controller_phase=self.signal_controller.controller_phase(),
+            phase_timer=round(self.signal_controller.phase_timer(), 3),
+            phase_duration=round(self.signal_controller.stage_duration(), 3),
+            min_green_remaining=round(self.signal_controller.min_green_remaining(), 3),
             vehicles=[self._vehicle_view(vehicle) for vehicle in self.vehicles],
             pedestrians=[self._pedestrian_view(pedestrian) for pedestrian in self.pedestrians],
             lanes=[lane.to_view() for lane in self.lanes.values()],
             crosswalks=[crosswalk.to_view() for crosswalk in self.crosswalks.values()],
             signals=self._signal_snapshot(),
-            pedestrian_phase_active=self.pedestrian_phase_active,
+            pedestrian_phase_active=self.signal_controller.current_phase.pedestrian_crossing is not None and self.signal_controller.controller_phase() == PHASE_GREEN,
             metrics=self.metrics,
+            traffic_brain=self.traffic_brain_state,
             events=list(self.events),
             config=self.config,
         )
@@ -401,676 +681,694 @@ class TrafficSimulationEngine:
             "north_crosswalk": CrosswalkDefinition(
                 id="north_crosswalk",
                 road_direction="NS",
-                start=Point2D(-12.0, 12.0),
-                end=Point2D(12.0, 12.0),
+                start=Point2D(-ROAD_SURFACE_HALF_WIDTH, CROSSWALK_CENTER_OFFSET),
+                end=Point2D(ROAD_SURFACE_HALF_WIDTH, CROSSWALK_CENTER_OFFSET),
                 movement=Point2D(1.0, 0.0),
             ),
             "south_crosswalk": CrosswalkDefinition(
                 id="south_crosswalk",
                 road_direction="NS",
-                start=Point2D(12.0, -12.0),
-                end=Point2D(-12.0, -12.0),
-                movement=Point2D(-1.0, 0.0),
+                start=Point2D(-ROAD_SURFACE_HALF_WIDTH, -CROSSWALK_CENTER_OFFSET),
+                end=Point2D(ROAD_SURFACE_HALF_WIDTH, -CROSSWALK_CENTER_OFFSET),
+                movement=Point2D(1.0, 0.0),
             ),
             "east_crosswalk": CrosswalkDefinition(
                 id="east_crosswalk",
                 road_direction="EW",
-                start=Point2D(12.0, -12.0),
-                end=Point2D(12.0, 12.0),
+                start=Point2D(CROSSWALK_CENTER_OFFSET, -ROAD_SURFACE_HALF_WIDTH),
+                end=Point2D(CROSSWALK_CENTER_OFFSET, ROAD_SURFACE_HALF_WIDTH),
                 movement=Point2D(0.0, 1.0),
             ),
             "west_crosswalk": CrosswalkDefinition(
                 id="west_crosswalk",
                 road_direction="EW",
-                start=Point2D(-12.0, 12.0),
-                end=Point2D(-12.0, -12.0),
-                movement=Point2D(0.0, -1.0),
+                start=Point2D(-CROSSWALK_CENTER_OFFSET, -ROAD_SURFACE_HALF_WIDTH),
+                end=Point2D(-CROSSWALK_CENTER_OFFSET, ROAD_SURFACE_HALF_WIDTH),
+                movement=Point2D(0.0, 1.0),
             ),
         }
 
     def _build_lanes(self) -> Dict[str, LaneDefinition]:
-        return {
-            "lane_north": LaneDefinition(
-                "lane_north",
-                "NORTH",
-                Point2D(0.0, 72.0),
-                Point2D(0.0, -72.0),
-                "north_crosswalk",
-                Point2D(0.0, 17.0),
-                Point2D(0.0, -1.0),
-                INTERSECTION_ENTRY_POINTS["NORTH"],
-                _distance(Point2D(0.0, 72.0), Point2D(0.0, 17.0)),
-                _distance(Point2D(0.0, 72.0), INTERSECTION_ENTRY_POINTS["NORTH"]),
-            ),
-            "lane_south": LaneDefinition(
-                "lane_south",
-                "SOUTH",
-                Point2D(4.0, -72.0),
-                Point2D(4.0, 72.0),
-                "south_crosswalk",
-                Point2D(4.0, -17.0),
-                Point2D(0.0, 1.0),
-                INTERSECTION_ENTRY_POINTS["SOUTH"],
-                _distance(Point2D(4.0, -72.0), Point2D(4.0, -17.0)),
-                _distance(Point2D(4.0, -72.0), INTERSECTION_ENTRY_POINTS["SOUTH"]),
-            ),
-            "lane_east": LaneDefinition(
-                "lane_east",
-                "EAST",
-                Point2D(72.0, 0.0),
-                Point2D(-72.0, 0.0),
-                "east_crosswalk",
-                Point2D(17.0, 0.0),
-                Point2D(-1.0, 0.0),
-                INTERSECTION_ENTRY_POINTS["EAST"],
-                _distance(Point2D(72.0, 0.0), Point2D(17.0, 0.0)),
-                _distance(Point2D(72.0, 0.0), INTERSECTION_ENTRY_POINTS["EAST"]),
-            ),
-            "lane_west": LaneDefinition(
-                "lane_west",
-                "WEST",
-                Point2D(-72.0, -4.0),
-                Point2D(72.0, -4.0),
-                "west_crosswalk",
-                Point2D(-17.0, -4.0),
-                Point2D(1.0, 0.0),
-                INTERSECTION_ENTRY_POINTS["WEST"],
-                _distance(Point2D(-72.0, -4.0), Point2D(-17.0, -4.0)),
-                _distance(Point2D(-72.0, -4.0), INTERSECTION_ENTRY_POINTS["WEST"]),
-            ),
-        }
+        lanes: Dict[str, LaneDefinition] = {}
 
-    def _signal_snapshot(self) -> Dict[str, SignalState]:
-        if self.pedestrian_phase_active or self.active_direction is None:
-            direction_states = {phase: RED for phase in PHASES}
-        else:
-            direction_states = {
-                phase: (self.phase_state if phase == self.active_direction else RED)
-                for phase in PHASES
-            }
-        direction_states["PED"] = GREEN if self.pedestrian_phase_active else RED
-        return direction_states
+        def add_lane(
+            lane_id: str,
+            approach: Approach,
+            lane_index: str,
+            movement: LaneMovement,
+            movement_id: str,
+            points: Iterable[Point2D],
+            stop_line_position: Point2D,
+            crosswalk_start: Point2D,
+            crosswalk_id: str,
+        ) -> None:
+            path = PolylinePath.from_points(points)
+            lanes[lane_id] = LaneDefinition(
+                id=lane_id,
+                direction=approach,
+                lane_index=lane_index,
+                movement=movement,
+                movement_id=movement_id,
+                direction_group=_direction_group(approach),
+                path=path,
+                stop_line_position=stop_line_position,
+                stop_distance=_distance(path.points[0], stop_line_position),
+                stop_crosswalk_id=crosswalk_id,
+                crosswalk_start=crosswalk_start,
+            )
 
-    def _phase_score(self, approach: Approach) -> float:
-        queued = 0
-        total_wait = 0.0
-        for vehicle in self.vehicles:
-            if vehicle.approach != approach:
-                continue
-            if vehicle.segment != "APPROACH":
-                continue
-            queued += 1
-            total_wait += vehicle.wait_time
-        return (queued * 2.0) + (total_wait * 1.5)
+        def add_straight_lane(
+            lane_id: str,
+            approach: Approach,
+            lane_position: float,
+            *,
+            vertical: bool,
+            start_sign: float,
+            crosswalk_id: str,
+        ) -> None:
+            if vertical:
+                start = Point2D(lane_position, start_sign * PATH_ENTRY_OFFSET)
+                end = Point2D(lane_position, -start_sign * PATH_EXIT_OFFSET)
+                stop = Point2D(lane_position, start_sign * STOP_OFFSET)
+                crosswalk_start = Point2D(lane_position, start_sign * CROSSWALK_OUTER_OFFSET)
+            else:
+                start = Point2D(start_sign * PATH_ENTRY_OFFSET, lane_position)
+                end = Point2D(-start_sign * PATH_EXIT_OFFSET, lane_position)
+                stop = Point2D(start_sign * STOP_OFFSET, lane_position)
+                crosswalk_start = Point2D(start_sign * CROSSWALK_OUTER_OFFSET, lane_position)
+            add_lane(
+                lane_id=lane_id,
+                approach=approach,
+                lane_index="outer",
+                movement="STRAIGHT",
+                movement_id=f"{approach[0]}_STRAIGHT",
+                points=(start, end),
+                stop_line_position=stop,
+                crosswalk_start=crosswalk_start,
+                crosswalk_id=crosswalk_id,
+            )
 
-    def _next_fixed_direction(self) -> Approach:
-        current_index = PHASES.index(self.active_direction or "NORTH")
-        return PHASES[(current_index + 1) % len(PHASES)]
+        def add_left_lane(
+            lane_id: str,
+            approach: Approach,
+            entry_start: Point2D,
+            stop_line_position: Point2D,
+            entry_box: Point2D,
+            control: Point2D,
+            exit_box: Point2D,
+            exit_end: Point2D,
+            crosswalk_start: Point2D,
+            crosswalk_id: str,
+        ) -> None:
+            curve = _sample_quadratic_bezier(entry_box, control, exit_box)
+            add_lane(
+                lane_id=lane_id,
+                approach=approach,
+                lane_index="inner",
+                movement="LEFT",
+                movement_id=f"{approach[0]}_LEFT",
+                points=(entry_start, stop_line_position, *curve[1:], exit_end),
+                stop_line_position=stop_line_position,
+                crosswalk_start=crosswalk_start,
+                crosswalk_id=crosswalk_id,
+            )
 
-    def _highest_priority_siren(self) -> Approach | None:
-        best: tuple[int, float, Approach] | None = None
-        for vehicle in self.vehicles:
-            if not vehicle.has_siren:
-                continue
-            if vehicle.segment != "APPROACH":
-                continue
-            candidate = (vehicle.priority, vehicle.wait_time, vehicle.approach)
-            if best is None or candidate > best:
-                best = candidate
-        return best[2] if best else None
+        add_straight_lane("lane_south_outer_straight", "SOUTH", OUTER_LANE_OFFSET, vertical=True, start_sign=-1.0, crosswalk_id="south_crosswalk")
+        add_straight_lane("lane_north_outer_straight", "NORTH", -OUTER_LANE_OFFSET, vertical=True, start_sign=1.0, crosswalk_id="north_crosswalk")
+        add_straight_lane("lane_west_outer_straight", "WEST", OUTER_LANE_OFFSET, vertical=False, start_sign=-1.0, crosswalk_id="west_crosswalk")
+        add_straight_lane("lane_east_outer_straight", "EAST", -OUTER_LANE_OFFSET, vertical=False, start_sign=1.0, crosswalk_id="east_crosswalk")
 
-    def _highest_priority_emergency_vehicle(self) -> Approach | None:
-        best: tuple[int, float, Approach] | None = None
-        for vehicle in self.vehicles:
-            if vehicle.priority <= 0:
-                continue
-            if vehicle.segment != "APPROACH":
-                continue
-            candidate = (vehicle.priority, vehicle.wait_time, vehicle.approach)
-            if best is None or candidate > best:
-                best = candidate
-        return best[2] if best else None
+        add_left_lane(
+            lane_id="lane_south_inner_left",
+            approach="SOUTH",
+            entry_start=Point2D(INNER_LANE_OFFSET, -PATH_ENTRY_OFFSET),
+            stop_line_position=Point2D(INNER_LANE_OFFSET, -STOP_OFFSET),
+            entry_box=Point2D(INNER_LANE_OFFSET, -INTERSECTION_HALF_SIZE),
+            control=Point2D(INNER_LANE_OFFSET, -INNER_LANE_OFFSET),
+            exit_box=Point2D(-INTERSECTION_HALF_SIZE, -INNER_LANE_OFFSET),
+            exit_end=Point2D(-PATH_EXIT_OFFSET, -INNER_LANE_OFFSET),
+            crosswalk_start=Point2D(INNER_LANE_OFFSET, -CROSSWALK_OUTER_OFFSET),
+            crosswalk_id="south_crosswalk",
+        )
+        add_left_lane(
+            lane_id="lane_north_inner_left",
+            approach="NORTH",
+            entry_start=Point2D(-INNER_LANE_OFFSET, PATH_ENTRY_OFFSET),
+            stop_line_position=Point2D(-INNER_LANE_OFFSET, STOP_OFFSET),
+            entry_box=Point2D(-INNER_LANE_OFFSET, INTERSECTION_HALF_SIZE),
+            control=Point2D(-INNER_LANE_OFFSET, INNER_LANE_OFFSET),
+            exit_box=Point2D(INTERSECTION_HALF_SIZE, INNER_LANE_OFFSET),
+            exit_end=Point2D(PATH_EXIT_OFFSET, INNER_LANE_OFFSET),
+            crosswalk_start=Point2D(-INNER_LANE_OFFSET, CROSSWALK_OUTER_OFFSET),
+            crosswalk_id="north_crosswalk",
+        )
+        add_left_lane(
+            lane_id="lane_west_inner_left",
+            approach="WEST",
+            entry_start=Point2D(-PATH_ENTRY_OFFSET, INNER_LANE_OFFSET),
+            stop_line_position=Point2D(-STOP_OFFSET, INNER_LANE_OFFSET),
+            entry_box=Point2D(-INTERSECTION_HALF_SIZE, INNER_LANE_OFFSET),
+            control=Point2D(INNER_LANE_OFFSET, INNER_LANE_OFFSET),
+            exit_box=Point2D(INNER_LANE_OFFSET, INTERSECTION_HALF_SIZE),
+            exit_end=Point2D(INNER_LANE_OFFSET, PATH_EXIT_OFFSET),
+            crosswalk_start=Point2D(-CROSSWALK_OUTER_OFFSET, INNER_LANE_OFFSET),
+            crosswalk_id="west_crosswalk",
+        )
+        add_left_lane(
+            lane_id="lane_east_inner_left",
+            approach="EAST",
+            entry_start=Point2D(PATH_ENTRY_OFFSET, -INNER_LANE_OFFSET),
+            stop_line_position=Point2D(STOP_OFFSET, -INNER_LANE_OFFSET),
+            entry_box=Point2D(INTERSECTION_HALF_SIZE, -INNER_LANE_OFFSET),
+            control=Point2D(-INNER_LANE_OFFSET, -INNER_LANE_OFFSET),
+            exit_box=Point2D(-INNER_LANE_OFFSET, -INTERSECTION_HALF_SIZE),
+            exit_end=Point2D(-INNER_LANE_OFFSET, -PATH_EXIT_OFFSET),
+            crosswalk_start=Point2D(CROSSWALK_OUTER_OFFSET, -INNER_LANE_OFFSET),
+            crosswalk_id="east_crosswalk",
+        )
+        return lanes
 
-    def _select_adaptive_direction(self) -> Approach:
-        scores = {phase: self._phase_score(phase) for phase in PHASES}
-        return max(PHASES, key=lambda phase: (scores[phase], -PHASES.index(phase)))
+    def _vehicle_spawn_interval(self) -> float:
+        intensity = _clamp(self.config.traffic_intensity, 0.0, 1.0)
+        return 3.0 - (2.0 * intensity)
 
-    def _choose_next_direction(self) -> Approach:
-        siren_direction = self._highest_priority_siren()
-        if siren_direction:
-            return siren_direction
-        if self.config.ai_mode == "fixed":
-            return self._next_fixed_direction()
-        if self.config.ai_mode == "emergency":
-            emergency_direction = self._highest_priority_emergency_vehicle()
-            if emergency_direction:
-                return emergency_direction
-        return self._select_adaptive_direction()
+    def _pedestrian_spawn_interval(self) -> float:
+        intensity = _clamp(self.config.traffic_intensity, 0.0, 1.0)
+        return 6.0 - (2.8 * intensity)
 
-    def _ensure_live_phase(self) -> None:
-        if self.pedestrian_phase_active:
-            return
-        if self.active_direction in PHASES:
-            return
-        self._force_direction(self.random.choice(PHASES), "inactive signal recovery")
+    def _lane_ids_for_route(self, approach: Approach, route: RouteType) -> List[str]:
+        movement = {"straight": "STRAIGHT", "left": "LEFT"}.get(route)
+        if movement is None:
+            return []
+        lane_ids = [
+            lane_id
+            for lane_id, lane in self.lanes.items()
+            if lane.direction == approach and lane.movement == movement
+        ]
+        return sorted(lane_ids)
 
-    def _force_direction(self, direction: Approach, reason: str) -> None:
-        self.active_direction = direction
-        self.phase_state = GREEN
-        self.phase_elapsed = 0.0
-        self.next_direction = None
-        self.pedestrian_phase_active = False
-        self._log("WARN", f"{direction} forced GREEN ({reason}).")
-
-    def _begin_yellow(self, next_direction: Approach | str | None, reason: str) -> None:
-        if self.phase_state == YELLOW:
-            return
-        self.phase_state = YELLOW
-        self.next_direction = next_direction
-        self.phase_elapsed = 0.0
-        self._log("INFO", f"{self.active_direction or 'ALL_RED'} changed to YELLOW ({reason}).")
-
-    def _activate_direction(self, direction: Approach) -> None:
-        self.active_direction = direction
-        self.next_direction = None
-        self.phase_state = GREEN
-        self.phase_elapsed = 0.0
-        self.pedestrian_phase_active = False
-        self._log("INFO", f"{direction} is now GREEN.")
-
-    def _activate_pedestrian_phase(self) -> None:
-        self.active_direction = None
-        self.next_direction = None
-        self.phase_state = RED
-        self.phase_elapsed = 0.0
-        self.pedestrian_phase_active = True
-        self._log("INFO", "Pedestrian crossing phase active. All vehicle directions forced RED.")
-
-    def _has_waiting_pedestrians(self) -> bool:
-        return any(pedestrian.state == "WAITING" for pedestrian in self.pedestrians)
-
-    def _has_crossing_pedestrians(self) -> bool:
-        return any(pedestrian.state == "CROSSING" for pedestrian in self.pedestrians)
-
-    def _can_start_pedestrian_phase(self) -> bool:
-        if not self._has_waiting_pedestrians():
-            return False
-        if self._highest_priority_siren():
-            return False
-        for vehicle in self.vehicles:
-            if vehicle.segment != "APPROACH":
-                return False
-            lane_distance = self._approach_distance(vehicle)
-            distance_to_stop = max(0.0, vehicle.stop_distance - lane_distance)
-            if lane_distance > vehicle.stop_distance + 0.012:
-                return False
-            if 0.0 < distance_to_stop < max(7.0, vehicle.speed * 1.35):
-                return False
-        return True
-
-    def update_signals(self, dt: float) -> None:
-        self.phase_elapsed += dt
-        emergency_direction = self._highest_priority_siren()
-
-        if self.pedestrian_phase_active:
-            if self.phase_elapsed >= PEDESTRIAN_MAX:
-                self._log("WARN", "Pedestrian phase timed out. Releasing vehicle flow.")
-                self._activate_direction(emergency_direction or self._choose_next_direction())
-                return
-            if not self._has_crossing_pedestrians() and self.phase_elapsed >= PEDESTRIAN_MIN:
-                self._activate_direction(emergency_direction or self._choose_next_direction())
-            return
-
-        if self.phase_state == YELLOW:
-            if self.phase_elapsed >= YELLOW_TIME:
-                if self.next_direction == "PEDESTRIAN":
-                    self._activate_pedestrian_phase()
-                else:
-                    self._activate_direction(self.next_direction or self._choose_next_direction())
-            return
-
-        if emergency_direction:
-            if self.active_direction != emergency_direction or self.phase_state != GREEN:
-                self._force_direction(emergency_direction, "emergency preemption")
-                return
-            if self.phase_elapsed < MAX_GREEN + EMERGENCY_EXTENSION:
-                return
-
-        if self.phase_elapsed >= MIN_GREEN and self._can_start_pedestrian_phase():
-            self._begin_yellow("PEDESTRIAN", "pedestrian demand")
-            return
-
-        if self.phase_elapsed < MIN_GREEN:
-            return
-
-        if self.config.ai_mode == "fixed":
-            if self.phase_elapsed >= MAX_GREEN:
-                self._begin_yellow(self._next_fixed_direction(), "fixed rotation")
-            return
-
-        best_direction = self._choose_next_direction()
-        current_score = self._phase_score(self.active_direction or "NORTH")
-        best_score = self._phase_score(best_direction)
-        if self.phase_elapsed >= MAX_GREEN:
-            self._begin_yellow(best_direction, "max green reached")
-        elif best_direction != self.active_direction and best_score > current_score + 1.2:
-            self._begin_yellow(best_direction, "higher demand")
-
-    def spawn_vehicles(self, dt: float) -> None:
+    def _spawn_vehicle(self) -> None:
         if len(self.vehicles) >= self.config.max_vehicles:
             return
 
-        base_rate = 0.56 * self.config.traffic_intensity
-        for approach in PHASES:
-            self.spawn_accumulators[approach] += dt * base_rate
-            if self.spawn_accumulators[approach] < 1.0:
+        approach_count = len(VEHICLE_APPROACHES)
+        for offset in range(approach_count):
+            index = (self._vehicle_spawn_cursor + offset) % approach_count
+            approach = VEHICLE_APPROACHES[index]
+            emergency_spawn = self._rng.random() < self.config.ambulance_frequency
+            route: RouteType = "left" if self._rng.random() < LEFT_TURN_PROBABILITY else "straight"
+            if emergency_spawn and self._rng.random() < EMERGENCY_ROUTE_PREFERENCE:
+                route = "straight"
+            lane_ids = self._lane_ids_for_route(approach, route)
+            if not lane_ids:
                 continue
-            self.spawn_accumulators[approach] -= 1.0
-            if len(self.vehicles) >= self.config.max_vehicles:
-                break
-            if self._entry_blocked(approach):
-                continue
-            self.vehicles.append(self._make_vehicle(approach))
 
-        if not self.vehicles and len(self.vehicles) < self.config.max_vehicles:
-            self.vehicles.append(self._make_vehicle("NORTH"))
+            lane_id = lane_ids[0]
+            if self._lane_has_spawn_room(lane_id):
+                vehicle = self._make_vehicle_for_lane(lane_id, emergency=emergency_spawn)
+                self.vehicles.append(vehicle)
+                self._vehicle_spawn_cursor = (index + 1) % approach_count
+                self._vehicle_spawn_timer = self._vehicle_spawn_interval()
+                descriptor = f"{vehicle.kind} {vehicle.route}" if vehicle.kind != "car" else f"{vehicle.route} vehicle"
+                self._log("INFO", f"Spawned {descriptor} on {self.lanes[lane_id].direction.lower()} approach.")
+                return
+        self._vehicle_spawn_timer = 0.35
 
-    def _entry_blocked(self, approach: Approach) -> bool:
-        for vehicle in self.vehicles:
-            if vehicle.approach != approach:
-                continue
-            if vehicle.segment == "APPROACH" and self._approach_distance(vehicle) < SAFE_DISTANCE:
-                return True
-        return False
+    def _lane_has_spawn_room(self, lane_id: str) -> bool:
+        return not any(
+            other.lane_id == lane_id and other.distance_along < (other.length + FOLLOW_GAP + 2.0)
+            for other in self.vehicles
+        )
 
-    def _sample_vehicle_kind(self) -> tuple[VehicleKind, bool]:
-        emergency_roll = self.random.random()
-        if emergency_roll < self.config.ambulance_frequency * 0.28:
-            kind = self.random.choices(
-                ["ambulance", "firetruck", "police"],
-                weights=[0.52, 0.28, 0.20],
-                k=1,
-            )[0]
-            return kind, True
-        return "car", False
+    def _spawn_pedestrian(self) -> None:
+        if len(self.pedestrians) >= self.config.max_pedestrians:
+            return
 
-    def _build_path(self, approach: Approach, route: RouteType) -> tuple[BezierPath, Point2D, Point2D, Point2D, Point2D]:
-        lane = self.lanes[f"lane_{approach.lower()}"]
-        if route == "straight":
-            exit_direction = STRAIGHT_EXIT[approach]
-        elif route == "left":
-            exit_direction = LEFT_EXIT[approach]
-        else:
-            exit_direction = RIGHT_EXIT[approach]
+        crosswalk_id, reverse = PEDESTRIAN_SPAWN_PLAN[self._pedestrian_spawn_cursor % len(PEDESTRIAN_SPAWN_PLAN)]
+        self._pedestrian_spawn_cursor += 1
+        candidate = self._make_pedestrian(crosswalk_id, reverse=reverse)
+        blocked = any(
+            pedestrian.crosswalk_id == candidate.crosswalk_id
+            and pedestrian.state == "WAITING"
+            and _distance(pedestrian.start_position, candidate.start_position) < 0.1
+            and _distance(pedestrian.position, candidate.position) < 1.2
+            for pedestrian in self.pedestrians
+        )
+        if blocked:
+            self._pedestrian_spawn_timer = 0.6
+            return
+        self.pedestrians.append(candidate)
+        self._pedestrian_spawn_timer = self._pedestrian_spawn_interval()
 
-        entry_point = lane.entry_point
-        exit_point = OUTBOUND_START_POINTS[exit_direction]
-        end_point = OUTBOUND_END_POINTS[exit_direction]
-        if route == "straight":
-            control = Point2D((entry_point.x + exit_point.x) / 2.0, (entry_point.y + exit_point.y) / 2.0)
-        elif route == "right":
-            control = Point2D(exit_point.x, entry_point.y)
-        else:
-            control = Point2D(
-                (entry_point.x + exit_point.x) / 2.0,
-                (entry_point.y + exit_point.y) / 2.0,
-            )
+    def _make_vehicle(self, approach: Approach, route: RouteType) -> VehicleStateModel:
+        lane_ids = self._lane_ids_for_route(approach, route)
+        if not lane_ids:
+            raise ValueError(f"No lane path defined for {approach.lower()} {route}.")
+        return self._make_vehicle_for_lane(lane_ids[0])
 
-        path = BezierPath.from_points(entry_point, control, exit_point)
-        return path, entry_point, exit_point, end_point, OUTBOUND_DIRECTION_VECTORS[exit_direction]
-
-    def _make_vehicle(self, approach: Approach) -> VehicleState:
+    def _make_vehicle_for_lane(self, lane_id: str, *, emergency: bool = False) -> VehicleStateModel:
+        lane = self.lanes[lane_id]
+        start_position = lane.path.point_at(0.0)
+        tangent = lane.path.tangent_at(0.0)
         self._vehicle_index += 1
-        kind, has_siren = self._sample_vehicle_kind()
-        route = self.random.choices(["straight", "left", "right"], weights=[0.56, 0.24, 0.20], k=1)[0]
-        lane = self.lanes[f"lane_{approach.lower()}"]
-        path, entry_point, exit_point, exit_end, exit_direction_vector = self._build_path(approach, route)
-        approach_length = lane.entry_distance
-        turn_length = max(path.length, 1.0)
-        exit_length = max(_distance(exit_point, exit_end), 1.0)
-        total_length = max(approach_length + turn_length + exit_length, 1.0)
-        stop_progress = lane.stop_distance / total_length
-        priority = VEHICLE_PRIORITIES[kind] if has_siren else 0
-        vehicle = VehicleState(
+        color = VEHICLE_COLOR_POOL[self._color_cursor % len(VEHICLE_COLOR_POOL)]
+        self._color_cursor += 1
+        length = round(_lerp(VEHICLE_MIN_LENGTH, VEHICLE_MAX_LENGTH, self._rng.random()), 3)
+        width = round(_lerp(VEHICLE_MIN_WIDTH, VEHICLE_MAX_WIDTH, self._rng.random()), 3)
+        if lane.movement == "STRAIGHT":
+            cruise_speed = round(_lerp(STRAIGHT_SPEED_MIN, STRAIGHT_SPEED_MAX, self._rng.random()), 3)
+            route: RouteType = "straight"
+        else:
+            cruise_speed = round(_lerp(LEFT_SPEED_MIN, LEFT_SPEED_MAX, self._rng.random()), 3)
+            route = "left"
+        kind: VehicleKind = "car"
+        has_siren = False
+        priority = 0
+        if emergency:
+            kind = "ambulance"
+            has_siren = True
+            priority = 2
+            color = "#f8fafc"
+            cruise_speed = round(cruise_speed * EMERGENCY_SPEED_MULTIPLIER, 3)
+            length = round(max(length, 5.1), 3)
+            width = round(max(width, 2.05), 3)
+        return VehicleStateModel(
             id=f"veh-{self._vehicle_index}",
-            lane_id=f"lane_{approach.lower()}",
-            approach=approach,
+            lane_id=lane_id,
             route=route,
-            path=path,
-            stop_progress=stop_progress,
             progress=0.0,
-            speed=CRUISE_SPEEDS[kind] * 0.35,
-            cruise_speed=CRUISE_SPEEDS[kind],
+            speed=0.0,
+            state="MOVING",
+            position=start_position,
+            heading=math.atan2(tangent.x, tangent.y),
+            velocity_x=0.0,
+            velocity_y=0.0,
+            wait_time=0.0,
+            cruise_speed=cruise_speed,
+            color=color,
+            distance_along=0.0,
             kind=kind,
             has_siren=has_siren,
             priority=priority,
-            state="MOVING",
-            wait_time=0.0,
-            color=VEHICLE_COLORS[kind],
-            position=Point2D(lane.start.x, lane.start.y),
-            direction_vector=lane.direction_vector,
-            entry_point=entry_point,
-            exit_point=exit_point,
-            exit_end=exit_end,
-            exit_direction_vector=exit_direction_vector,
-            stop_distance=lane.stop_distance,
-            approach_length=approach_length,
-            turn_length=turn_length,
-            exit_length=exit_length,
-            total_length=total_length,
-        )
-        self._update_vehicle_progress(vehicle)
-        self._update_vehicle_kinematics(vehicle)
-        self._log("WARN" if has_siren else "INFO", f"{kind.title()} entered from {approach}.")
-        return vehicle
-
-    def _vehicle_has_right_of_way(self, vehicle: VehicleState) -> bool:
-        if vehicle.segment != "APPROACH":
-            return True
-        if self.pedestrian_phase_active or self._has_crossing_pedestrians():
-            return False
-        return self.active_direction == vehicle.approach and self.phase_state == GREEN
-
-    def _update_vehicle_progress(self, vehicle: VehicleState) -> None:
-        travelled = vehicle.approach_distance + vehicle.turn_distance + vehicle.exit_distance
-        vehicle.progress = min(1.0, travelled / max(vehicle.total_length, 1.0))
-
-    def _approach_distance(self, vehicle: VehicleState) -> float:
-        lane = self.lanes[vehicle.lane_id]
-        if vehicle.segment == "APPROACH":
-            return _distance_along_segment(vehicle.position, lane.start, lane.entry_point)
-        if vehicle.segment == "TURNING":
-            return lane.entry_distance + min(vehicle.turn_distance, vehicle.turn_length * 0.25)
-        return lane.entry_distance + vehicle.turn_length + vehicle.exit_distance
-
-    def _clamp_to_approach_lane(self, vehicle: VehicleState) -> None:
-        lane = self.lanes[vehicle.lane_id]
-        vehicle.position = _project_to_segment(vehicle.position, lane.start, lane.entry_point)
-        vehicle.direction_vector = lane.direction_vector
-        vehicle.approach_distance = _distance_along_segment(vehicle.position, lane.start, lane.entry_point)
-        self._update_vehicle_progress(vehicle)
-
-    def _clamp_to_exit_lane(self, vehicle: VehicleState) -> None:
-        vehicle.position = _project_to_segment(vehicle.position, vehicle.exit_point, vehicle.exit_end)
-        vehicle.direction_vector = vehicle.exit_direction_vector
-        vehicle.exit_distance = _distance_along_segment(vehicle.position, vehicle.exit_point, vehicle.exit_end)
-        self._update_vehicle_progress(vehicle)
-
-    def _advance_vehicle(self, vehicle: VehicleState, distance: float) -> bool:
-        remaining = max(0.0, distance)
-
-        while remaining > 1e-9:
-            if vehicle.segment == "APPROACH":
-                lane = self.lanes[vehicle.lane_id]
-                available = max(0.0, lane.entry_distance - vehicle.approach_distance)
-                step = min(remaining, available)
-                vehicle.position = _advance_point(vehicle.position, lane.direction_vector, step)
-                self._clamp_to_approach_lane(vehicle)
-                remaining -= step
-                if vehicle.approach_distance >= lane.entry_distance - 1e-4:
-                    vehicle.segment = "TURNING"
-                    vehicle.position = Point2D(vehicle.entry_point.x, vehicle.entry_point.y)
-                    vehicle.direction_vector = _normalize(
-                        vehicle.path.tangent_at(0.0).x,
-                        vehicle.path.tangent_at(0.0).y,
-                    )
-                    self._update_vehicle_progress(vehicle)
-                else:
-                    break
-            elif vehicle.segment == "TURNING":
-                available = max(0.0, vehicle.turn_length - vehicle.turn_distance)
-                step = min(remaining, available)
-                vehicle.turn_distance += step
-                turn_progress = min(1.0, vehicle.turn_distance / max(vehicle.turn_length, 1.0))
-                vehicle.position = vehicle.path.point_at(turn_progress)
-                remaining -= step
-                self._update_vehicle_progress(vehicle)
-                if turn_progress >= 1.0 - 1e-6:
-                    vehicle.segment = "EXIT"
-                    vehicle.position = Point2D(vehicle.exit_point.x, vehicle.exit_point.y)
-                    vehicle.direction_vector = vehicle.exit_direction_vector
-                else:
-                    break
-            else:
-                available = max(0.0, vehicle.exit_length - vehicle.exit_distance)
-                step = min(remaining, available)
-                vehicle.position = _advance_point(vehicle.position, vehicle.exit_direction_vector, step)
-                self._clamp_to_exit_lane(vehicle)
-                remaining -= step
-                if vehicle.exit_distance >= vehicle.exit_length - 1e-4:
-                    vehicle.progress = 1.0
-                    return True
-                break
-
-        return vehicle.progress >= 1.0
-
-    def update_vehicles(self, dt: float) -> None:
-        buckets: Dict[Approach, List[VehicleState]] = defaultdict(list)
-        for vehicle in self.vehicles:
-            buckets[vehicle.approach].append(vehicle)
-
-        processed_this_tick = 0
-        moved_this_tick = 0
-        survivors: List[VehicleState] = []
-        for approach, vehicles in buckets.items():
-            turning_and_exit = [vehicle for vehicle in vehicles if vehicle.segment != "APPROACH"]
-            approach_queue = [vehicle for vehicle in vehicles if vehicle.segment == "APPROACH"]
-
-            for vehicle in turning_and_exit:
-                previous_position = Point2D(vehicle.position.x, vehicle.position.y)
-                target_speed = vehicle.cruise_speed * (1.08 if vehicle.has_siren else 1.0)
-                acceleration = 18.0 if target_speed > vehicle.speed else 24.0
-                speed_delta = target_speed - vehicle.speed
-                vehicle.speed += max(-acceleration * dt, min(acceleration * dt, speed_delta))
-
-                if self._advance_vehicle(vehicle, vehicle.speed * dt):
-                    processed_this_tick += 1
-                    self.processed_vehicles += 1
-                    continue
-
-                vehicle.state = "TURNING" if vehicle.segment == "TURNING" else "MOVING"
-                if _distance(previous_position, vehicle.position) > 1e-5:
-                    moved_this_tick += 1
-                self._update_vehicle_kinematics(vehicle)
-                survivors.append(vehicle)
-
-            approach_queue.sort(key=self._approach_distance, reverse=True)
-            leader: VehicleState | None = None
-            for vehicle in approach_queue:
-                previous_position = Point2D(vehicle.position.x, vehicle.position.y)
-                target_speed = vehicle.cruise_speed
-                has_right_of_way = self._vehicle_has_right_of_way(vehicle)
-                lane = self.lanes[vehicle.lane_id]
-                lane_distance = self._approach_distance(vehicle)
-                distance_to_stop = max(0.0, lane.stop_distance - lane_distance)
-
-                if not has_right_of_way:
-                    if distance_to_stop <= 0.6:
-                        vehicle.position = Point2D(lane.stop_line_position.x, lane.stop_line_position.y)
-                        vehicle.approach_distance = lane.stop_distance
-                        vehicle.progress = vehicle.stop_progress
-                        vehicle.speed = 0.0
-                        vehicle.wait_time += dt
-                        vehicle.state = "WAITING"
-                        self._update_vehicle_kinematics(vehicle)
-                        survivors.append(vehicle)
-                        leader = vehicle
-                        continue
-                    if lane_distance >= lane.stop_distance - 1e-3:
-                        vehicle.position = Point2D(lane.stop_line_position.x, lane.stop_line_position.y)
-                        vehicle.approach_distance = lane.stop_distance
-                        vehicle.progress = vehicle.stop_progress
-                        vehicle.speed = 0.0
-                        vehicle.wait_time += dt
-                        vehicle.state = "WAITING"
-                        self._update_vehicle_kinematics(vehicle)
-                        survivors.append(vehicle)
-                        leader = vehicle
-                        continue
-                    braking_window = max(SAFE_DISTANCE * 1.8, vehicle.speed * 1.6)
-                    if distance_to_stop <= braking_window:
-                        target_speed = min(target_speed, max(0.0, (distance_to_stop - 0.5) * 1.2))
-
-                if leader is not None:
-                    emergency_gap = SAFE_DISTANCE * (EMERGENCY_GAP_FACTOR if vehicle.has_siren else 1.0)
-                    gap = max(0.0, self._approach_distance(leader) - lane_distance)
-                    if gap < emergency_gap:
-                        target_speed = min(target_speed, max(0.0, (gap - 1.0) * 0.9), leader.speed)
-
-                acceleration = 16.0 if target_speed > vehicle.speed else 25.0
-                speed_delta = target_speed - vehicle.speed
-                vehicle.speed += max(-acceleration * dt, min(acceleration * dt, speed_delta))
-
-                if not has_right_of_way and distance_to_stop <= 1.0 and vehicle.speed < 1.0:
-                    vehicle.position = Point2D(lane.stop_line_position.x, lane.stop_line_position.y)
-                    vehicle.approach_distance = lane.stop_distance
-                    vehicle.progress = vehicle.stop_progress
-                    vehicle.speed = 0.0
-                    vehicle.wait_time += dt
-                    vehicle.state = "WAITING"
-                    self._update_vehicle_kinematics(vehicle)
-                    survivors.append(vehicle)
-                    leader = vehicle
-                    continue
-
-                move_distance = vehicle.speed * dt
-                if not has_right_of_way and lane_distance + move_distance >= lane.stop_distance:
-                    move_distance = max(0.0, lane.stop_distance - lane_distance)
-                    vehicle.speed = 0.0
-
-                if self._advance_vehicle(vehicle, move_distance):
-                    processed_this_tick += 1
-                    self.processed_vehicles += 1
-                    continue
-
-                if vehicle.speed < 0.8:
-                    vehicle.wait_time += dt
-                    vehicle.state = "WAITING"
-                else:
-                    vehicle.state = "TURNING" if vehicle.segment == "TURNING" else "MOVING"
-
-                if _distance(previous_position, vehicle.position) > 1e-5:
-                    moved_this_tick += 1
-                self._update_vehicle_kinematics(vehicle)
-                survivors.append(vehicle)
-                leader = vehicle if vehicle.segment == "APPROACH" else None
-
-        self.vehicles = survivors
-        self.vehicles_moved_last_tick = moved_this_tick + processed_this_tick
-        if self.vehicles_moved_last_tick == 0 and self.vehicles:
-            self.ticks_without_movement += 1
-        else:
-            self.ticks_without_movement = 0
-        if self.ticks_without_movement >= DEADLOCK_TICK_LIMIT and not self.pedestrian_phase_active:
-            self._force_direction(self.random.choice(PHASES), "movement deadlock recovery")
-            self.ticks_without_movement = 0
-        instant_throughput = processed_this_tick / dt if dt > 0.0 else 0.0
-        self.smoothed_throughput = (self.smoothed_throughput * 0.72) + (instant_throughput * 0.28)
-
-    def _update_vehicle_kinematics(self, vehicle: VehicleState) -> None:
-        if vehicle.segment == "TURNING":
-            turn_progress = min(1.0, vehicle.turn_distance / max(vehicle.turn_length, 1.0))
-            tangent = vehicle.path.tangent_at(turn_progress)
-            vehicle.direction_vector = _normalize(tangent.x, tangent.y)
-        vehicle.velocity_x = vehicle.direction_vector.x * vehicle.speed
-        vehicle.velocity_y = vehicle.direction_vector.y * vehicle.speed
-        vehicle.heading = math.atan2(vehicle.direction_vector.x, vehicle.direction_vector.y)
-
-    def update_pedestrians(self, dt: float) -> None:
-        self.pedestrian_spawn_accumulator += dt * 0.45
-        if self.pedestrian_spawn_accumulator >= 1.0 and len(self.pedestrians) < self.config.max_pedestrians:
-            self.pedestrian_spawn_accumulator -= 1.0
-            crosswalk = self.crosswalks[self.random.choice(list(self.crosswalks.keys()))]
-            self._pedestrian_index += 1
-            self.pedestrians.append(
-                PedestrianStateModel(
-                    id=f"ped-{self._pedestrian_index}",
-                    crosswalk_id=crosswalk.id,
-                    road_direction=crosswalk.road_direction,
-                    progress=0.0,
-                    speed=2.5,
-                    wait_time=0.0,
-                )
-            )
-
-        survivors: List[PedestrianStateModel] = []
-        for pedestrian in self.pedestrians:
-            crosswalk = self.crosswalks[pedestrian.crosswalk_id]
-            if pedestrian.state == "WAITING":
-                pedestrian.wait_time += dt
-                pedestrian.velocity_x = 0.0
-                pedestrian.velocity_y = 0.0
-                if self.pedestrian_phase_active:
-                    pedestrian.state = "CROSSING"
-                    self._log("INFO", f"Pedestrian started crossing {crosswalk.id}.")
-            if pedestrian.state == "CROSSING":
-                pedestrian.progress += (pedestrian.speed / max(crosswalk.length, 1.0)) * dt
-                pedestrian.velocity_x = crosswalk.movement.x * pedestrian.speed
-                pedestrian.velocity_y = crosswalk.movement.y * pedestrian.speed
-                if pedestrian.progress >= 1.0:
-                    self._log("INFO", f"Pedestrian completed {crosswalk.id}.")
-                    continue
-            survivors.append(pedestrian)
-        self.pedestrians = survivors
-
-    def compute_metrics(self, dt: float) -> None:
-        queued = sum(1 for vehicle in self.vehicles if vehicle.state == "WAITING")
-        total_wait = sum(vehicle.wait_time for vehicle in self.vehicles)
-        avg_wait = total_wait / len(self.vehicles) if self.vehicles else 0.0
-        queue_pressure = min(1.0, ((queued * 1.8) + len(self.vehicles)) / max(1, self.config.max_vehicles * 1.8))
-        detections = len(self.events)
-        emergency_count = sum(1 for vehicle in self.vehicles if vehicle.priority > 0)
-        throughput = self.smoothed_throughput if self.processed_vehicles else (0.0 if not self.vehicles else max(0.6, self.smoothed_throughput))
-        self.metrics = MetricsView(
-            avg_wait_time=round(avg_wait, 3),
-            throughput=round(throughput, 3),
-            vehicles_processed=self.processed_vehicles,
-            queue_pressure=round(queue_pressure, 3),
-            active_vehicles=len(self.vehicles),
-            active_pedestrians=len(self.pedestrians),
-            queued_vehicles=queued,
-            emergency_vehicles=emergency_count,
-            active_nodes=12,
-            detections=detections,
-            bandwidth_savings=round(18.0 + (throughput * 1.75) + (emergency_count * 0.9), 2),
+            length=length,
+            width=width,
         )
 
-    def _vehicle_view(self, vehicle: VehicleState) -> VehicleView:
+    def _make_pedestrian(self, crosswalk_id: str, *, reverse: bool = False) -> PedestrianStateModel:
+        crosswalk = self.crosswalks[crosswalk_id]
+        start = crosswalk.end if reverse else crosswalk.start
+        target = crosswalk.start if reverse else crosswalk.end
+        self._pedestrian_index += 1
+        direction = _normalize(target.x - start.x, target.y - start.y)
+        return PedestrianStateModel(
+            id=f"ped-{self._pedestrian_index}",
+            crossing=crosswalk.movement_direction,
+            crosswalk_id=crosswalk_id,
+            road_direction=crosswalk.road_direction,
+            start_position=start,
+            target_position=target,
+            position=Point2D(start.x, start.y),
+            progress=0.0,
+            speed=PEDESTRIAN_SPEED,
+            target_crosswalk=crosswalk_id,
+            look_angle=math.atan2(direction.x, direction.y),
+        )
+
+    def _vehicle_view(self, vehicle: VehicleStateModel) -> VehicleView:
+        lane = self.lanes[vehicle.lane_id]
         return VehicleView(
             id=vehicle.id,
             lane_id=vehicle.lane_id,
-            approach=vehicle.approach,
+            approach=lane.direction,
             route=vehicle.route,
             progress=round(vehicle.progress, 4),
-            speed=round(vehicle.speed, 3),
-            velocity_x=round(vehicle.velocity_x, 3),
-            velocity_y=round(vehicle.velocity_y, 3),
+            speed=round(vehicle.speed, 4),
+            velocity_x=round(vehicle.velocity_x, 4),
+            velocity_y=round(vehicle.velocity_y, 4),
             heading=round(vehicle.heading, 4),
-            x=round(vehicle.position.x, 3),
-            y=round(vehicle.position.y, 3),
+            x=round(vehicle.position.x, 4),
+            y=round(vehicle.position.y, 4),
             kind=vehicle.kind,
             has_siren=vehicle.has_siren,
             priority=vehicle.priority,
             state=vehicle.state,
             wait_time=round(vehicle.wait_time, 3),
             color=vehicle.color,
+            length=vehicle.length,
+            width=vehicle.width,
         )
 
     def _pedestrian_view(self, pedestrian: PedestrianStateModel) -> PedestrianView:
-        crosswalk = self.crosswalks[pedestrian.crosswalk_id]
-        position = crosswalk.point_at(pedestrian.progress)
         return PedestrianView(
             id=pedestrian.id,
+            crossing=pedestrian.crossing,
+            target_crosswalk=pedestrian.target_crosswalk or pedestrian.crosswalk_id,
             crosswalk_id=pedestrian.crosswalk_id,
             road_direction=pedestrian.road_direction,
             progress=round(pedestrian.progress, 4),
-            speed=round(pedestrian.speed, 3),
-            velocity_x=round(pedestrian.velocity_x, 3),
-            velocity_y=round(pedestrian.velocity_y, 3),
-            x=round(position.x, 3),
-            y=round(position.y, 3),
+            speed=round(pedestrian.speed, 4),
+            velocity_x=round(pedestrian.velocity_x, 4),
+            velocity_y=round(pedestrian.velocity_y, 4),
+            x=round(pedestrian.position.x, 4),
+            y=round(pedestrian.position.y, 4),
             state=pedestrian.state,
             wait_time=round(pedestrian.wait_time, 3),
+            is_elderly=pedestrian.is_elderly,
+            is_impatient=pedestrian.is_impatient,
+            risky_crossing=pedestrian.risky_crossing,
+            look_angle=round(pedestrian.look_angle, 4),
+        )
+
+    def _is_vehicle_queued(self, vehicle: VehicleStateModel) -> bool:
+        lane = self.lanes[vehicle.lane_id]
+        return (
+            vehicle.distance_along <= lane.stop_distance + 0.5
+            and (vehicle.state == "STOPPED" or vehicle.wait_time > 0.0 or vehicle.speed <= MIN_MOVEMENT_STEP)
+        )
+
+    def _traffic_brain_vehicle_inputs(self) -> List[VehicleTelemetryInput]:
+        telemetry: List[VehicleTelemetryInput] = []
+        for vehicle in self.vehicles:
+            lane = self.lanes[vehicle.lane_id]
+            telemetry.append(
+                VehicleTelemetryInput(
+                    id=vehicle.id,
+                    lane_id=vehicle.lane_id,
+                    approach=lane.direction,
+                    wait_time=vehicle.wait_time,
+                    speed=vehicle.speed,
+                    cruise_speed=vehicle.cruise_speed,
+                    state=vehicle.state,
+                    distance_to_stop=lane.stop_distance - vehicle.distance_along,
+                    queued=self._is_vehicle_queued(vehicle),
+                    kind=vehicle.kind,
+                    has_siren=vehicle.has_siren,
+                )
+            )
+        return telemetry
+
+    def _traffic_brain_pedestrian_inputs(self) -> List[PedestrianTelemetryInput]:
+        return [
+            PedestrianTelemetryInput(
+                crossing=pedestrian.crossing,
+                wait_time=pedestrian.wait_time,
+                state=pedestrian.state,
+            )
+            for pedestrian in self.pedestrians
+        ]
+
+    def _build_traffic_brain_state(self, dt: float, *, brain: TrafficBrain | None = None):
+        active_brain = brain or self.traffic_brain
+        return active_brain.evaluate(
+            dt=dt,
+            current_phase=self.signal_controller.state,
+            controller_phase=self.signal_controller.controller_phase(),
+            vehicles=self._traffic_brain_vehicle_inputs(),
+            pedestrians=self._traffic_brain_pedestrian_inputs(),
+            lane_phase_map=self.lane_phase_map,
+            phase_lane_ids=self.phase_lane_ids,
+            phase_crossings={phase: definition.pedestrian_crossing for phase, definition in PHASE_DEFINITIONS.items()},
+            phase_order=PHASE_ORDER,
+            unserved_demand_time=self.signal_controller.unserved_demand_time,
+            processed_by_approach=self._vehicles_processed_by_approach_last_tick,
+        )
+
+    def _phase_maps_from_brain(self, brain_state) -> tuple[Dict[SignalCycleState, Dict[str, float]], Dict[SignalCycleState, float], Dict[SignalCycleState, bool]]:
+        phase_demands: Dict[SignalCycleState, Dict[str, float]] = {}
+        phase_scores: Dict[SignalCycleState, float] = {}
+        phase_has_demand: Dict[SignalCycleState, bool] = {}
+
+        for phase in PHASE_ORDER:
+            score_view = brain_state.phase_scores[phase]
+            phase_demands[phase] = {
+                "queue": round(score_view.queue_length, 3),
+                "wait_time": round(score_view.avg_wait_time, 3),
+                "pedestrian_demand": round(score_view.pedestrian_demand, 3),
+                "flow_rate": round(score_view.flow_rate, 3),
+                "congestion_trend": round(score_view.congestion_component, 3),
+                "fairness_boost": round(score_view.fairness_boost, 3),
+                "emergency_boost": round(score_view.emergency_boost, 3),
+                "score": round(score_view.score, 3),
+            }
+            phase_scores[phase] = round(score_view.score, 3)
+            phase_has_demand[phase] = bool(score_view.demand_active)
+
+        return phase_demands, phase_scores, phase_has_demand
+
+    def _lane_queue_stats(self, lane_id: str) -> tuple[float, float]:
+        queued_vehicles = [
+            vehicle
+            for vehicle in self.vehicles
+            if vehicle.lane_id == lane_id and self._is_vehicle_queued(vehicle)
+        ]
+        queue_length = float(len(queued_vehicles))
+        wait_time = float(sum(vehicle.wait_time for vehicle in queued_vehicles))
+        return queue_length, wait_time
+
+    def calculate_phase_demands(
+        self,
+    ) -> tuple[Dict[SignalCycleState, Dict[str, float]], Dict[SignalCycleState, float], Dict[SignalCycleState, bool]]:
+        preview_brain = TrafficBrain()
+        preview_brain.reset()
+        brain_state = self._build_traffic_brain_state(0.0, brain=preview_brain)
+        return self._phase_maps_from_brain(brain_state)
+
+    def _refresh_phase_demand_cache(self, dt: float) -> None:
+        self.traffic_brain_state = self._build_traffic_brain_state(dt)
+        phase_demands, phase_scores, phase_has_demand = self._phase_maps_from_brain(self.traffic_brain_state)
+        self.phase_demands = phase_demands
+        self.phase_scores = phase_scores
+        self.phase_has_demand = phase_has_demand
+
+    def _reset_signals(self) -> Dict[str, SignalState]:
+        return {approach: RED for approach in SIGNAL_DIRECTIONS}
+
+    def _set_signal_state(self, signals: Dict[str, SignalState], approach: Approach, state: SignalState) -> None:
+        signals[approach] = state
+
+    def _apply_phase(self, signals: Dict[str, SignalState], phase: SignalCycleState, stage: ControllerPhase) -> None:
+        if stage == PHASE_YELLOW:
+            phase_state: SignalState = YELLOW
+        elif phase in {NS_LEFT, EW_LEFT}:
+            phase_state = GREEN_LEFT
+        else:
+            phase_state = GREEN
+
+        if phase in {NS_STRAIGHT, NS_LEFT}:
+            active_directions: tuple[Approach, ...] = ("NORTH", "SOUTH")
+        else:
+            active_directions = ("EAST", "WEST")
+
+        for approach in active_directions:
+            self._set_signal_state(signals, approach, phase_state)
+
+    def _signal_snapshot(self) -> Dict[str, SignalState]:
+        signals = self._reset_signals()
+        if self.signal_controller.controller_phase() != PHASE_ALL_RED:
+            self._apply_phase(signals, self.signal_controller.state, self.signal_controller.controller_phase())
+        return signals
+
+    def _vehicles_clear_of_intersection(self) -> bool:
+        for vehicle in self.vehicles:
+            clearance_margin = max(vehicle.length, vehicle.width) / 2.0
+            if (
+                abs(vehicle.position.x) <= INTERSECTION_HALF_SIZE + clearance_margin
+                and abs(vehicle.position.y) <= INTERSECTION_HALF_SIZE + clearance_margin
+            ):
+                return False
+        return True
+
+    def _vehicle_can_commit_on_yellow(self, vehicle: VehicleStateModel, lane: LaneDefinition) -> bool:
+        if self.signal_controller.controller_phase() != PHASE_YELLOW:
+            return False
+        # Yellow is only a short commit window for vehicles already too close to stop comfortably.
+        if self.signal_controller.phase_timer() > YELLOW_COMMIT_WINDOW:
+            return False
+        if lane.movement_id not in self.signal_controller.current_phase.movement_ids:
+            return False
+        if vehicle.speed < YELLOW_MIN_COMMIT_SPEED:
+            return False
+
+        distance_to_stop = max(0.0, lane.stop_distance - vehicle.distance_along)
+        stopping_distance = (vehicle.speed * vehicle.speed) / max(2.0 * BRAKE_RATE, 1e-6)
+        commit_distance = max(2.5, stopping_distance + YELLOW_REACTION_BUFFER)
+        return distance_to_stop <= commit_distance
+
+    def update_signals(self, dt: float) -> None:
+        preview_brain = copy.deepcopy(self.traffic_brain)
+        self.traffic_brain_state = self._build_traffic_brain_state(dt, brain=preview_brain)
+        phase_demands, phase_scores, phase_has_demand = self._phase_maps_from_brain(self.traffic_brain_state)
+        self.phase_demands = phase_demands
+        self.phase_scores = phase_scores
+        self.phase_has_demand = phase_has_demand
+        transitions = self.signal_controller.update(
+            dt,
+            self.phase_scores,
+            self.phase_has_demand,
+            intersection_clear=self._vehicles_clear_of_intersection(),
+        )
+        self.current_state = self.signal_controller.state
+        for state, stage in transitions:
+            if stage == PHASE_YELLOW:
+                next_phase = self.signal_controller.next_phase_name.replace("_", " ")
+                self._log("INFO", f"{state.replace('_', ' ')} entered yellow before {next_phase}.")
+            elif stage == PHASE_ALL_RED:
+                self._log("INFO", f"{state.replace('_', ' ')} entered all-red clearance.")
+            else:
+                score = self.phase_scores.get(state, 0.0)
+                self._log("INFO", f"{state.replace('_', ' ')} is now green. Score {score:.2f}.")
+
+    def update_vehicles(self, dt: float) -> None:
+        if dt <= 0.0:
+            return
+
+        self._vehicle_spawn_timer -= dt
+        while self._vehicle_spawn_timer <= 0.0 and len(self.vehicles) < self.config.max_vehicles:
+            self._spawn_vehicle()
+
+        lanes_to_vehicles: Dict[str, List[VehicleStateModel]] = {}
+        for vehicle in self.vehicles:
+            lanes_to_vehicles.setdefault(vehicle.lane_id, []).append(vehicle)
+
+        survivors: List[VehicleStateModel] = []
+        for lane_id, lane_vehicles in lanes_to_vehicles.items():
+            lane = self.lanes[lane_id]
+            lane_vehicles.sort(key=lambda item: item.distance_along, reverse=True)
+            leader_distance = math.inf
+            leader_length = VEHICLE_MAX_LENGTH
+            leader_speed = 0.0
+
+            for vehicle in lane_vehicles:
+                allowed_distance = lane.path.length
+                can_enter_on_green = self.signal_controller.can_vehicle_move(lane.direction, vehicle.route)
+                can_commit_on_yellow = self._vehicle_can_commit_on_yellow(vehicle, lane)
+                if vehicle.distance_along < lane.stop_distance and not (can_enter_on_green or can_commit_on_yellow):
+                    allowed_distance = min(
+                        allowed_distance,
+                        max(0.0, lane.stop_distance - ((vehicle.length / 2.0) + STOP_LINE_BUFFER)),
+                    )
+
+                if leader_distance < math.inf:
+                    spacing_limit = leader_distance - (((leader_length + vehicle.length) / 2.0) + FOLLOW_GAP)
+                    allowed_distance = min(allowed_distance, spacing_limit)
+
+                allowed_distance = max(vehicle.distance_along, allowed_distance)
+                target_speed = vehicle.cruise_speed if allowed_distance > vehicle.distance_along + MIN_MOVEMENT_STEP else 0.0
+
+                if leader_distance < math.inf:
+                    gap_to_leader = leader_distance - vehicle.distance_along - (((leader_length + vehicle.length) / 2.0) + FOLLOW_GAP)
+                    follow_ratio = _clamp(gap_to_leader / FOLLOW_RESPONSE_DISTANCE, 0.0, 1.0)
+                    target_speed = min(target_speed, _lerp(leader_speed, vehicle.cruise_speed, follow_ratio))
+
+                rate = ACCELERATION if target_speed >= vehicle.speed else BRAKE_RATE
+                updated_speed = _move_toward(vehicle.speed, target_speed, rate * dt)
+                candidate_distance = min(lane.path.length, vehicle.distance_along + (updated_speed * dt))
+                next_distance = min(candidate_distance, allowed_distance)
+
+                if next_distance <= vehicle.distance_along + MIN_MOVEMENT_STEP:
+                    next_distance = vehicle.distance_along
+                    updated_speed = 0.0
+
+                actual_speed = (next_distance - vehicle.distance_along) / dt if dt > 0.0 else 0.0
+                next_progress = next_distance / lane.path.length
+                tangent = lane.path.tangent_at(next_progress)
+
+                vehicle.position = lane.path.point_at(next_progress)
+                vehicle.distance_along = next_distance
+                vehicle.progress = next_progress
+                vehicle.heading = math.atan2(tangent.x, tangent.y)
+                vehicle.velocity_x = tangent.x * actual_speed
+                vehicle.velocity_y = tangent.y * actual_speed
+                vehicle.speed = actual_speed
+                vehicle.state = "MOVING" if actual_speed > MIN_MOVEMENT_STEP else "STOPPED"
+                vehicle.wait_time = vehicle.wait_time + dt if vehicle.state == "STOPPED" else 0.0
+
+                if next_distance >= lane.path.length - MIN_MOVEMENT_STEP:
+                    self.processed_vehicles += 1
+                    self._vehicles_processed_last_tick += 1
+                    self._vehicles_processed_by_approach_last_tick[lane.direction] += 1
+                else:
+                    survivors.append(vehicle)
+                    leader_distance = next_distance
+                    leader_length = vehicle.length
+                    leader_speed = actual_speed
+
+        self.vehicles = survivors
+
+    def update_pedestrians(self, dt: float) -> None:
+        if dt <= 0.0:
+            return
+
+        self._pedestrian_spawn_timer -= dt
+        while self._pedestrian_spawn_timer <= 0.0 and len(self.pedestrians) < self.config.max_pedestrians:
+            self._spawn_pedestrian()
+
+        remaining_green = self.signal_controller.phase_time_remaining()
+        survivors: List[PedestrianStateModel] = []
+
+        for pedestrian in self.pedestrians:
+            total_distance = max(_distance(pedestrian.start_position, pedestrian.target_position), 1e-6)
+            crossing_time = total_distance / max(pedestrian.speed, 1e-6)
+
+            if pedestrian.state == "WAITING":
+                pedestrian.velocity_x = 0.0
+                pedestrian.velocity_y = 0.0
+                if self.signal_controller.pedestrians_can_cross(pedestrian.crossing) and remaining_green >= crossing_time + 0.15:
+                    pedestrian.state = "CROSSING"
+                    pedestrian.wait_time = 0.0
+                else:
+                    pedestrian.wait_time += dt
+                    survivors.append(pedestrian)
+                    continue
+
+            direction = _normalize(
+                pedestrian.target_position.x - pedestrian.position.x,
+                pedestrian.target_position.y - pedestrian.position.y,
+            )
+            remaining_distance = _distance(pedestrian.position, pedestrian.target_position)
+            if remaining_distance <= PEDESTRIAN_SNAP_DISTANCE:
+                continue
+
+            travel = min(pedestrian.speed * dt, remaining_distance)
+            pedestrian.position = Point2D(
+                x=pedestrian.position.x + (direction.x * travel),
+                y=pedestrian.position.y + (direction.y * travel),
+            )
+            after_move = _distance(pedestrian.position, pedestrian.target_position)
+            if after_move <= PEDESTRIAN_SNAP_DISTANCE:
+                continue
+
+            pedestrian.progress = 1.0 - (after_move / total_distance)
+            pedestrian.velocity_x = direction.x * (travel / dt)
+            pedestrian.velocity_y = direction.y * (travel / dt)
+            pedestrian.look_angle = math.atan2(direction.x, direction.y)
+            pedestrian.wait_time = 0.0
+            survivors.append(pedestrian)
+
+        self.pedestrians = survivors
+
+    def compute_metrics(self, dt: float) -> None:
+        active_vehicles = len(self.vehicles)
+        queued_vehicles = sum(1 for vehicle in self.vehicles if vehicle.state == "STOPPED")
+        active_pedestrians = len(self.pedestrians)
+        crossing_pedestrians = sum(1 for pedestrian in self.pedestrians if pedestrian.state == "CROSSING")
+        emergency_vehicles = sum(1 for vehicle in self.vehicles if vehicle.has_siren or vehicle.kind != "car")
+        avg_wait_time = sum(vehicle.wait_time for vehicle in self.vehicles) / active_vehicles if active_vehicles else 0.0
+        throughput_now = self._vehicles_processed_last_tick / max(dt, FRAME_DT) if dt > 0.0 else 0.0
+        self.smoothed_throughput = throughput_now if self.frame <= 1 else _lerp(self.smoothed_throughput, throughput_now, 0.18)
+        queue_pressure = (queued_vehicles / active_vehicles) if active_vehicles else 0.0
+        self.metrics = MetricsView(
+            avg_wait_time=round(avg_wait_time, 3),
+            throughput=round(self.smoothed_throughput, 3),
+            vehicles_processed=self.processed_vehicles,
+            queue_pressure=round(queue_pressure, 3),
+            active_vehicles=active_vehicles,
+            active_pedestrians=active_pedestrians,
+            queued_vehicles=queued_vehicles,
+            emergency_vehicles=emergency_vehicles,
+            active_nodes=12,
+            detections=queued_vehicles + crossing_pedestrians,
+            bandwidth_savings=round(12.0 + (queue_pressure * 18.0), 2),
         )
 
     def _log(self, level: str, message: str) -> None:
