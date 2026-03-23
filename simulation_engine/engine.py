@@ -17,6 +17,7 @@ from shared.contracts import (
     CrosswalkView,
     EventView,
     LaneArcView,
+    LaneKind,
     LaneMovement,
     LaneView,
     MetricsView,
@@ -48,6 +49,7 @@ WEST: SignalCycleState = "WEST"
 SIGNAL_ORDER: tuple[SignalCycleState, ...] = (NORTH, EAST, SOUTH, WEST)
 
 GREEN_INTERVAL = 7.0
+LEFT_TURN_PROBABILITY = 0.18
 RIGHT_TURN_PROBABILITY = 0.22
 EMERGENCY_STRAIGHT_BIAS = 0.82
 STARVATION_SCALE = 1.0
@@ -78,17 +80,23 @@ STRAIGHT_SPEED_MIN = 8.8
 STRAIGHT_SPEED_MAX = 10.6
 RIGHT_SPEED_MIN = 6.2
 RIGHT_SPEED_MAX = 7.2
+SLIP_SPEED_MIN = 6.8
+SLIP_SPEED_MAX = 7.8
 ACCELERATION = 8.0
 BRAKE_RATE = 16.0
 FOLLOW_GAP = 5.0
 FOLLOW_RESPONSE_DISTANCE = 20.0
 STOP_LINE_BUFFER = 0.25
 MIN_MOVEMENT_STEP = 1e-3
+MERGE_APPROACH_DISTANCE = 18.0
 PEDESTRIAN_SIDEWALK_OFFSET = 2.2
 PEDESTRIAN_MIN_SPEED = 1.1
 PEDESTRIAN_MAX_SPEED = 1.55
 PEDESTRIAN_SPAWN_INTERVAL = 4.0
 PEDESTRIAN_ENTRY_EPSILON = 0.08
+SLIP_CORNER_OFFSET = STOP_OFFSET + LANE_WIDTH
+SLIP_TURN_RADIUS = SLIP_CORNER_OFFSET - OUTER_LANE_OFFSET
+SLIP_TRANSITION_LENGTH = LANE_WIDTH
 
 VEHICLE_COLOR_POOL = ("#3b82f6", "#ef4444", "#facc15", "#22c55e", "#f8fafc")
 VEHICLE_APPROACHES: tuple[Approach, ...] = ("NORTH", "EAST", "SOUTH", "WEST")
@@ -111,6 +119,30 @@ def _distance(a: Point2D, b: Point2D) -> float:
 def _normalize(dx: float, dy: float) -> Point2D:
     magnitude = math.hypot(dx, dy) or 1.0
     return Point2D(dx / magnitude, dy / magnitude)
+
+
+def _left_normal(direction: Point2D) -> Point2D:
+    return Point2D(-direction.y, direction.x)
+
+
+def _offset_point(point: Point2D, direction: Point2D, distance: float) -> Point2D:
+    return Point2D(
+        x=point.x + (direction.x * distance),
+        y=point.y + (direction.y * distance),
+    )
+
+
+def _line_intersection(origin_a: Point2D, direction_a: Point2D, origin_b: Point2D, direction_b: Point2D) -> Point2D:
+    determinant = (direction_a.x * direction_b.y) - (direction_a.y * direction_b.x)
+    if abs(determinant) <= 1e-6:
+        raise ValueError("Cannot intersect parallel slip-lane tangents.")
+    delta_x = origin_b.x - origin_a.x
+    delta_y = origin_b.y - origin_a.y
+    t = ((delta_x * direction_b.y) - (delta_y * direction_b.x)) / determinant
+    return Point2D(
+        x=origin_a.x + (direction_a.x * t),
+        y=origin_a.y + (direction_a.y * t),
+    )
 
 
 def _move_toward(current: float, target: float, max_delta: float) -> float:
@@ -145,7 +177,18 @@ def _right_turn_exit(approach: Approach) -> Approach:
     }[approach]
 
 
+def _left_turn_exit(approach: Approach) -> Approach:
+    return {
+        "NORTH": "EAST",
+        "EAST": "SOUTH",
+        "SOUTH": "WEST",
+        "WEST": "NORTH",
+    }[approach]
+
+
 def _exit_direction_for_movement(approach: Approach, route: RouteType) -> Approach:
+    if route == "left":
+        return _left_turn_exit(approach)
     if route == "right":
         return _right_turn_exit(approach)
     return _opposite_approach(approach)
@@ -224,6 +267,12 @@ class CircularArc:
             y=self.center.y + (self.radius * math.sin(angle)),
         )
 
+    def heading_at_distance(self, distance_along: float) -> float:
+        angle = self.angle_at_distance(distance_along)
+        offset = math.pi if self.clockwise else 0.0
+        heading = -angle + offset
+        return math.atan2(math.sin(heading), math.cos(heading))
+
     def tangent_at_distance(self, distance_along: float) -> Point2D:
         angle = self.angle_at_distance(distance_along)
         if self.clockwise:
@@ -234,6 +283,8 @@ class CircularArc:
         return LaneArcView(
             center=self.center,
             radius=round(self.radius, 6),
+            inner_radius=round(max(0.0, self.radius - (LANE_WIDTH / 2.0)), 6),
+            outer_radius=round(self.radius + (LANE_WIDTH / 2.0), 6),
             start_angle=round(self.start_angle, 6),
             end_angle=round(self.end_angle, 6),
             clockwise=self.clockwise,
@@ -288,6 +339,31 @@ class PolylinePath:
         start = self.points[-2]
         end = self.points[-1]
         return _normalize(end.x - start.x, end.y - start.y)
+
+    def tangent_at(self, t: float) -> Point2D:
+        return self.tangent_at_distance(self.length * _clamp(t, 0.0, 1.0))
+
+
+@dataclass(frozen=True)
+class CircularArcPath:
+    points: tuple[Point2D, ...]
+    arc: CircularArc
+    length: float
+
+    @classmethod
+    def from_arc(cls, arc: CircularArc) -> "CircularArcPath":
+        start = arc.point_at_distance(0.0)
+        end = arc.point_at_distance(arc.length)
+        return cls(points=(start, end), arc=arc, length=arc.length)
+
+    def point_at_distance(self, distance_along: float) -> Point2D:
+        return self.arc.point_at_distance(distance_along)
+
+    def point_at(self, t: float) -> Point2D:
+        return self.point_at_distance(self.length * _clamp(t, 0.0, 1.0))
+
+    def tangent_at_distance(self, distance_along: float) -> Point2D:
+        return self.arc.tangent_at_distance(distance_along)
 
     def tangent_at(self, t: float) -> Point2D:
         return self.tangent_at_distance(self.length * _clamp(t, 0.0, 1.0))
@@ -363,6 +439,7 @@ class TurnArcPath:
 @dataclass(frozen=True)
 class LaneDefinition:
     id: str
+    kind: LaneKind
     direction: Approach
     lane_index: str
     movement: LaneMovement
@@ -374,6 +451,8 @@ class LaneDefinition:
     crosswalk_start: Point2D
     queue_group: str
     queue_release_distance: float
+    merge_group: str | None = None
+    merge_distance: float | None = None
     arc: LaneArcView | None = None
     turn_entry: Point2D | None = None
     turn_exit: Point2D | None = None
@@ -381,7 +460,7 @@ class LaneDefinition:
     def to_view(self) -> LaneView:
         return LaneView(
             id=self.id,
-            kind="main",
+            kind=self.kind,
             approach=self.direction,
             direction=self.direction,
             movement=self.movement,
@@ -418,6 +497,9 @@ class VehicleStateModel:
     priority: int = 0
     length: float = VEHICLE_MIN_LENGTH
     width: float = VEHICLE_MIN_WIDTH
+    arc_angle: float | None = None
+    arc_radius: float | None = None
+    arc_center: Point2D | None = None
 
 
 @dataclass
@@ -522,15 +604,21 @@ class TrafficSimulationEngine:
         self.crosswalks = self._build_crosswalks()
         self.lanes = self._build_lanes()
         self.phase_lane_ids = {
-            direction: tuple(lane_id for lane_id, lane in self.lanes.items() if lane.direction == direction)
+            direction: tuple(
+                lane_id
+                for lane_id, lane in self.lanes.items()
+                if lane.direction == direction and lane.kind == "main"
+            )
             for direction in SIGNAL_ORDER
         }
-        self.lane_phase_map = {lane_id: lane.direction for lane_id, lane in self.lanes.items()}
+        self.lane_phase_map = {
+            lane_id: lane.direction for lane_id, lane in self.lanes.items() if lane.kind == "main"
+        }
         self._rng = random.Random(13)
         self.events: Deque[EventView] = deque(maxlen=40)
         self.traffic_brain = TrafficBrain()
         self.reset()
-        self._log("INFO", "Single-green controller initialized with strict straight and right lane routing.")
+        self._log("INFO", "Single-green controller initialized with straight, right, and free-slip left lane routing.")
 
     def reset(self) -> None:
         self.config = SimulationConfig(ai_mode="fixed", max_vehicles=36, max_pedestrians=0)
@@ -735,10 +823,15 @@ class TrafficSimulationEngine:
             crosswalk_start: Point2D,
             queue_group: str,
             queue_release_position: Point2D | None = None,
+            *,
+            kind: LaneKind = "main",
+            merge_group: str | None = None,
+            merge_position: Point2D | None = None,
         ) -> None:
             path = PolylinePath.from_points(points)
             lanes[lane_id] = LaneDefinition(
                 id=lane_id,
+                kind=kind,
                 direction=approach,
                 lane_index=lane_index,
                 movement=movement,
@@ -753,6 +846,12 @@ class TrafficSimulationEngine:
                     _distance(path.points[0], queue_release_position)
                     if queue_release_position is not None
                     else path.length
+                ),
+                merge_group=merge_group,
+                merge_distance=(
+                    _distance(path.points[0], merge_position)
+                    if merge_position is not None
+                    else None
                 ),
             )
 
@@ -769,7 +868,9 @@ class TrafficSimulationEngine:
             "north_crosswalk",
             Point2D(OUTER_LANE_OFFSET, CROSSWALK_OUTER_OFFSET),
             "lane_north_straight",
-            Point2D(OUTER_LANE_OFFSET, INTERSECTION_HALF_SIZE),
+            Point2D(OUTER_LANE_OFFSET, SLIP_CORNER_OFFSET),
+            merge_group="lane_north_straight",
+            merge_position=Point2D(OUTER_LANE_OFFSET, -SLIP_CORNER_OFFSET),
         )
         add_lane(
             "lane_south_straight",
@@ -784,7 +885,9 @@ class TrafficSimulationEngine:
             "south_crosswalk",
             Point2D(-OUTER_LANE_OFFSET, -CROSSWALK_OUTER_OFFSET),
             "lane_south_straight",
-            Point2D(-OUTER_LANE_OFFSET, -INTERSECTION_HALF_SIZE),
+            Point2D(-OUTER_LANE_OFFSET, -SLIP_CORNER_OFFSET),
+            merge_group="lane_south_straight",
+            merge_position=Point2D(-OUTER_LANE_OFFSET, SLIP_CORNER_OFFSET),
         )
         add_lane(
             "lane_east_straight",
@@ -799,7 +902,9 @@ class TrafficSimulationEngine:
             "east_crosswalk",
             Point2D(CROSSWALK_OUTER_OFFSET, -OUTER_LANE_OFFSET),
             "lane_east_straight",
-            Point2D(INTERSECTION_HALF_SIZE, -OUTER_LANE_OFFSET),
+            Point2D(SLIP_CORNER_OFFSET, -OUTER_LANE_OFFSET),
+            merge_group="lane_east_straight",
+            merge_position=Point2D(-SLIP_CORNER_OFFSET, -OUTER_LANE_OFFSET),
         )
         add_lane(
             "lane_west_straight",
@@ -814,10 +919,12 @@ class TrafficSimulationEngine:
             "west_crosswalk",
             Point2D(-CROSSWALK_OUTER_OFFSET, OUTER_LANE_OFFSET),
             "lane_west_straight",
-            Point2D(-INTERSECTION_HALF_SIZE, OUTER_LANE_OFFSET),
+            Point2D(-SLIP_CORNER_OFFSET, OUTER_LANE_OFFSET),
+            merge_group="lane_west_straight",
+            merge_position=Point2D(SLIP_CORNER_OFFSET, OUTER_LANE_OFFSET),
         )
 
-        def add_turn_lane(
+        def add_arc_lane(
             lane_id: str,
             approach: Approach,
             lane_index: str,
@@ -831,12 +938,16 @@ class TrafficSimulationEngine:
             crosswalk_id: str,
             crosswalk_start: Point2D,
             queue_group: str,
+            *,
+            kind: LaneKind = "main",
+            arc_clockwise: bool = True,
+            merge_group: str | None = None,
         ) -> None:
             arc = CircularArc.from_center(
                 arc_center,
                 turn_entry,
                 turn_exit,
-                clockwise=True,
+                clockwise=arc_clockwise,
             )
             path = TurnArcPath.from_points(
                 entry_start,
@@ -847,6 +958,7 @@ class TrafficSimulationEngine:
             )
             lanes[lane_id] = LaneDefinition(
                 id=lane_id,
+                kind=kind,
                 direction=approach,
                 lane_index=lane_index,
                 movement=movement,
@@ -858,12 +970,74 @@ class TrafficSimulationEngine:
                 crosswalk_start=crosswalk_start,
                 queue_group=queue_group,
                 queue_release_distance=_distance(path.points[0], turn_entry),
+                merge_group=merge_group,
+                merge_distance=(path.entry_length + arc.length) if merge_group is not None else None,
                 arc=arc.to_view(),
                 turn_entry=turn_entry,
                 turn_exit=turn_exit,
             )
 
-        add_turn_lane(
+        def add_slip_lane(approach: Approach) -> None:
+            incoming_lane_id = f"lane_{approach.lower()}_straight"
+            exit_direction = _left_turn_exit(approach)
+            outgoing_approach = _opposite_approach(exit_direction)
+            outgoing_lane_id = f"lane_{outgoing_approach.lower()}_straight"
+            incoming_lane = lanes[incoming_lane_id]
+            outgoing_lane = lanes[outgoing_lane_id]
+
+            incoming_direction = incoming_lane.path.tangent_at_distance(0.0)
+            outgoing_direction = outgoing_lane.path.tangent_at_distance(0.0)
+            incoming_normal = _left_normal(incoming_direction)
+            outgoing_normal = _left_normal(outgoing_direction)
+            if outgoing_lane.merge_distance is None:
+                raise ValueError(f"Missing merge point for slip-lane destination {outgoing_lane_id}.")
+
+            turn_entry = incoming_lane.path.point_at_distance(incoming_lane.queue_release_distance)
+            turn_exit = outgoing_lane.path.point_at_distance(outgoing_lane.merge_distance)
+            arc_center = _line_intersection(
+                turn_entry,
+                incoming_normal,
+                turn_exit,
+                outgoing_normal,
+            )
+            entry_start = _offset_point(turn_entry, incoming_direction, -SLIP_TRANSITION_LENGTH)
+            exit_end = _offset_point(turn_exit, outgoing_direction, SLIP_TRANSITION_LENGTH)
+            arc = CircularArc.from_center(
+                arc_center,
+                turn_entry,
+                turn_exit,
+                clockwise=False,
+            )
+            path = TurnArcPath.from_points(
+                entry_start,
+                turn_entry,
+                arc,
+                turn_exit,
+                exit_end,
+            )
+            lane_id = f"lane_{approach.lower()}_left_slip"
+            lanes[lane_id] = LaneDefinition(
+                id=lane_id,
+                kind="slip",
+                direction=approach,
+                lane_index="slip",
+                movement="LEFT",
+                movement_id=f"{approach[0]}_LEFT",
+                path=path,
+                stop_line_position=turn_entry,
+                stop_distance=path.entry_length,
+                stop_crosswalk_id=outgoing_lane.stop_crosswalk_id,
+                crosswalk_start=turn_entry,
+                queue_group=lane_id,
+                queue_release_distance=path.entry_length + arc.length,
+                merge_group=outgoing_lane_id,
+                merge_distance=path.length,
+                arc=arc.to_view(),
+                turn_entry=turn_entry,
+                turn_exit=turn_exit,
+            )
+
+        add_arc_lane(
             "lane_north_right",
             "NORTH",
             "inner",
@@ -878,7 +1052,7 @@ class TrafficSimulationEngine:
             Point2D(INNER_LANE_OFFSET, CROSSWALK_OUTER_OFFSET),
             "lane_north_right",
         )
-        add_turn_lane(
+        add_arc_lane(
             "lane_south_right",
             "SOUTH",
             "inner",
@@ -893,7 +1067,7 @@ class TrafficSimulationEngine:
             Point2D(-INNER_LANE_OFFSET, -CROSSWALK_OUTER_OFFSET),
             "lane_south_right",
         )
-        add_turn_lane(
+        add_arc_lane(
             "lane_east_right",
             "EAST",
             "inner",
@@ -908,7 +1082,7 @@ class TrafficSimulationEngine:
             Point2D(CROSSWALK_OUTER_OFFSET, -INNER_LANE_OFFSET),
             "lane_east_right",
         )
-        add_turn_lane(
+        add_arc_lane(
             "lane_west_right",
             "WEST",
             "inner",
@@ -923,6 +1097,8 @@ class TrafficSimulationEngine:
             Point2D(-CROSSWALK_OUTER_OFFSET, INNER_LANE_OFFSET),
             "lane_west_right",
         )
+        for approach in SIGNAL_ORDER:
+            add_slip_lane(approach)
         return lanes
 
     def _vehicle_spawn_interval(self) -> float:
@@ -934,7 +1110,7 @@ class TrafficSimulationEngine:
         return PEDESTRIAN_SPAWN_INTERVAL - (1.25 * intensity)
 
     def _lane_ids_for_route(self, approach: Approach, route: RouteType) -> List[str]:
-        movement = {"straight": "STRAIGHT", "right": "RIGHT"}.get(route)
+        movement = {"straight": "STRAIGHT", "right": "RIGHT", "left": "LEFT"}.get(route)
         if movement is None:
             return []
         lane_ids = [
@@ -953,7 +1129,13 @@ class TrafficSimulationEngine:
             index = (self._vehicle_spawn_cursor + offset) % approach_count
             approach = VEHICLE_APPROACHES[index]
             emergency_spawn = self._rng.random() < self.config.ambulance_frequency
-            route: RouteType = "right" if self._rng.random() < RIGHT_TURN_PROBABILITY else "straight"
+            route_roll = self._rng.random()
+            if route_roll < LEFT_TURN_PROBABILITY:
+                route: RouteType = "left"
+            elif route_roll < LEFT_TURN_PROBABILITY + RIGHT_TURN_PROBABILITY:
+                route = "right"
+            else:
+                route = "straight"
             if emergency_spawn and self._rng.random() < EMERGENCY_STRAIGHT_BIAS:
                 route = "straight"
             lane_ids = self._lane_ids_for_route(approach, route)
@@ -992,16 +1174,100 @@ class TrafficSimulationEngine:
             raise ValueError(f"No lane path defined for {approach.lower()} {route}.")
         return self._make_vehicle_for_lane(lane_ids[0])
 
+    def _lane_pose_at_distance(
+        self,
+        lane: LaneDefinition,
+        distance_along: float,
+    ) -> tuple[Point2D, Point2D, float, float | None, float | None, Point2D | None]:
+        clamped_distance = _clamp(distance_along, 0.0, lane.path.length)
+        if isinstance(lane.path, CircularArcPath):
+            angle = lane.path.arc.angle_at_distance(clamped_distance)
+            position = Point2D(
+                x=lane.path.arc.center.x + (lane.path.arc.radius * math.cos(angle)),
+                y=lane.path.arc.center.y + (lane.path.arc.radius * math.sin(angle)),
+            )
+            tangent = lane.path.arc.tangent_at_distance(clamped_distance)
+            heading = lane.path.arc.heading_at_distance(clamped_distance)
+            return (
+                position,
+                tangent,
+                heading,
+                angle,
+                lane.path.arc.radius,
+                lane.path.arc.center,
+            )
+
+        if isinstance(lane.path, TurnArcPath):
+            entry_start, turn_entry, turn_exit, exit_end = lane.path.points
+            if lane.path.entry_length > 1e-6 and clamped_distance < lane.path.entry_length:
+                position = lane.path.point_at_distance(clamped_distance)
+                tangent = _normalize(turn_entry.x - entry_start.x, turn_entry.y - entry_start.y)
+                heading = math.atan2(tangent.x, tangent.y)
+                return position, tangent, heading, None, None, None
+
+            arc_distance = clamped_distance - lane.path.entry_length
+            if 0.0 <= arc_distance <= lane.path.arc.length:
+                angle = lane.path.arc.angle_at_distance(max(0.0, arc_distance))
+                position = Point2D(
+                    x=lane.path.arc.center.x + (lane.path.arc.radius * math.cos(angle)),
+                    y=lane.path.arc.center.y + (lane.path.arc.radius * math.sin(angle)),
+                )
+                tangent = lane.path.arc.tangent_at_distance(max(0.0, arc_distance))
+                heading = lane.path.arc.heading_at_distance(max(0.0, arc_distance))
+                return (
+                    position,
+                    tangent,
+                    heading,
+                    angle,
+                    lane.path.arc.radius,
+                    lane.path.arc.center,
+                )
+
+            position = lane.path.point_at_distance(clamped_distance)
+            tangent = _normalize(exit_end.x - turn_exit.x, exit_end.y - turn_exit.y)
+            heading = math.atan2(tangent.x, tangent.y)
+            return position, tangent, heading, None, None, None
+
+        position = lane.path.point_at_distance(clamped_distance)
+        tangent = lane.path.tangent_at_distance(clamped_distance)
+        heading = math.atan2(tangent.x, tangent.y)
+        return position, tangent, heading, None, None, None
+
+    def _apply_vehicle_pose(
+        self,
+        vehicle: VehicleStateModel,
+        lane: LaneDefinition,
+        distance_along: float,
+        *,
+        speed: float,
+    ) -> None:
+        clamped_distance = _clamp(distance_along, 0.0, lane.path.length)
+        position, tangent, heading, arc_angle, arc_radius, arc_center = self._lane_pose_at_distance(
+            lane,
+            clamped_distance,
+        )
+        vehicle.position = position
+        vehicle.distance_along = clamped_distance
+        vehicle.progress = clamped_distance / lane.path.length
+        vehicle.heading = heading
+        vehicle.velocity_x = tangent.x * speed
+        vehicle.velocity_y = tangent.y * speed
+        vehicle.arc_angle = arc_angle
+        vehicle.arc_radius = arc_radius
+        vehicle.arc_center = arc_center
+
     def _make_vehicle_for_lane(self, lane_id: str, *, emergency: bool = False) -> VehicleStateModel:
         lane = self.lanes[lane_id]
-        start_position = lane.path.point_at_distance(0.0)
-        tangent = lane.path.tangent_at_distance(0.0)
+        start_position, _, heading, arc_angle, arc_radius, arc_center = self._lane_pose_at_distance(lane, 0.0)
         self._vehicle_index += 1
         color = VEHICLE_COLOR_POOL[self._color_cursor % len(VEHICLE_COLOR_POOL)]
         self._color_cursor += 1
         length = round(_lerp(VEHICLE_MIN_LENGTH, VEHICLE_MAX_LENGTH, self._rng.random()), 3)
         width = round(_lerp(VEHICLE_MIN_WIDTH, VEHICLE_MAX_WIDTH, self._rng.random()), 3)
-        if lane.movement == "RIGHT":
+        if lane.kind == "slip" or lane.movement == "LEFT":
+            cruise_speed = round(_lerp(SLIP_SPEED_MIN, SLIP_SPEED_MAX, self._rng.random()), 3)
+            route: RouteType = "left"
+        elif lane.movement == "RIGHT":
             cruise_speed = round(_lerp(RIGHT_SPEED_MIN, RIGHT_SPEED_MAX, self._rng.random()), 3)
             route: RouteType = "right"
         else:
@@ -1028,7 +1294,7 @@ class TrafficSimulationEngine:
             speed=0.0,
             state="MOVING",
             position=start_position,
-            heading=math.atan2(tangent.x, tangent.y),
+            heading=heading,
             velocity_x=0.0,
             velocity_y=0.0,
             wait_time=0.0,
@@ -1040,6 +1306,9 @@ class TrafficSimulationEngine:
             priority=priority,
             length=length,
             width=width,
+            arc_angle=arc_angle,
+            arc_radius=arc_radius,
+            arc_center=arc_center,
         )
 
     def _vehicle_view(self, vehicle: VehicleStateModel) -> VehicleView:
@@ -1092,6 +1361,8 @@ class TrafficSimulationEngine:
 
     def _is_vehicle_queued(self, vehicle: VehicleStateModel) -> bool:
         lane = self.lanes[vehicle.lane_id]
+        if lane.kind == "slip":
+            return False
         return (
             vehicle.distance_along <= lane.stop_distance + 0.5
             and (vehicle.state == "STOPPED" or vehicle.wait_time > 0.0 or vehicle.speed <= MIN_MOVEMENT_STEP)
@@ -1101,6 +1372,8 @@ class TrafficSimulationEngine:
         telemetry: List[VehicleTelemetryInput] = []
         for vehicle in self.vehicles:
             lane = self.lanes[vehicle.lane_id]
+            if lane.kind == "slip":
+                continue
             telemetry.append(
                 VehicleTelemetryInput(
                     id=vehicle.id,
@@ -1310,6 +1583,8 @@ class TrafficSimulationEngine:
     def _crosswalk_has_vehicle_commitment(self, crosswalk_id: str) -> bool:
         for vehicle in self.vehicles:
             lane = self.lanes[vehicle.lane_id]
+            if lane.kind == "slip":
+                continue
             if lane.stop_crosswalk_id != crosswalk_id:
                 continue
             crosswalk_distance = _distance(lane.path.points[0], lane.crosswalk_start)
@@ -1341,6 +1616,40 @@ class TrafficSimulationEngine:
             )
         return spacing_limit
 
+    def _merge_spacing_limit(
+        self,
+        vehicle: VehicleStateModel,
+        lane: LaneDefinition,
+        merge_group_vehicles: Dict[str, List[VehicleStateModel]],
+    ) -> float:
+        if lane.merge_group is None or lane.merge_distance is None:
+            return math.inf
+
+        distance_to_merge = lane.merge_distance - vehicle.distance_along
+        if distance_to_merge > MERGE_APPROACH_DISTANCE:
+            return math.inf
+
+        vehicle_shared_progress = vehicle.distance_along - lane.merge_distance
+        spacing_limit = math.inf
+        for other in merge_group_vehicles.get(lane.merge_group, []):
+            if other.id == vehicle.id or other.lane_id == vehicle.lane_id:
+                continue
+            other_lane = self.lanes[other.lane_id]
+            if other_lane.merge_distance is None:
+                continue
+            other_distance_to_merge = other_lane.merge_distance - other.distance_along
+            if other_distance_to_merge > MERGE_APPROACH_DISTANCE:
+                continue
+            other_shared_progress = other.distance_along - other_lane.merge_distance
+            if other_shared_progress <= vehicle_shared_progress:
+                continue
+            equivalent_leader_distance = lane.merge_distance + other_shared_progress
+            spacing_limit = min(
+                spacing_limit,
+                equivalent_leader_distance - (((other.length + vehicle.length) / 2.0) + FOLLOW_GAP),
+            )
+        return spacing_limit
+
     def update_signals(self, dt: float) -> None:
         next_direction = self.signal_controller.update(dt, intersection_clear=self._intersection_clear())
         self.current_state = self.signal_controller.state
@@ -1359,9 +1668,12 @@ class TrafficSimulationEngine:
         for vehicle in self.vehicles:
             lanes_to_vehicles.setdefault(vehicle.lane_id, []).append(vehicle)
         queue_group_vehicles: Dict[str, List[VehicleStateModel]] = {}
+        merge_group_vehicles: Dict[str, List[VehicleStateModel]] = {}
         for vehicle in self.vehicles:
             lane = self.lanes[vehicle.lane_id]
             queue_group_vehicles.setdefault(lane.queue_group, []).append(vehicle)
+            if lane.merge_group is not None:
+                merge_group_vehicles.setdefault(lane.merge_group, []).append(vehicle)
 
         survivors: List[VehicleStateModel] = []
         for lane_id, lane_vehicles in lanes_to_vehicles.items():
@@ -1373,13 +1685,14 @@ class TrafficSimulationEngine:
 
             for vehicle in lane_vehicles:
                 allowed_distance = lane.path.length
-                can_move = self.signal_controller.can_vehicle_move(lane.direction, vehicle.route)
-                if vehicle.distance_along < lane.stop_distance and self._crosswalk_is_active(lane.stop_crosswalk_id):
+                signal_controlled = lane.kind != "slip"
+                can_move = True if not signal_controlled else self.signal_controller.can_vehicle_move(lane.direction, vehicle.route)
+                if signal_controlled and vehicle.distance_along < lane.stop_distance and self._crosswalk_is_active(lane.stop_crosswalk_id):
                     allowed_distance = min(
                         allowed_distance,
                         max(0.0, lane.stop_distance - ((vehicle.length / 2.0) + STOP_LINE_BUFFER)),
                     )
-                if vehicle.distance_along < lane.stop_distance and not can_move:
+                if signal_controlled and vehicle.distance_along < lane.stop_distance and not can_move:
                     allowed_distance = min(
                         allowed_distance,
                         max(0.0, lane.stop_distance - ((vehicle.length / 2.0) + STOP_LINE_BUFFER)),
@@ -1392,6 +1705,10 @@ class TrafficSimulationEngine:
                 allowed_distance = min(
                     allowed_distance,
                     self._shared_lane_spacing_limit(vehicle, lane, queue_group_vehicles),
+                )
+                allowed_distance = min(
+                    allowed_distance,
+                    self._merge_spacing_limit(vehicle, lane, merge_group_vehicles),
                 )
 
                 allowed_distance = max(vehicle.distance_along, allowed_distance)
@@ -1412,15 +1729,12 @@ class TrafficSimulationEngine:
                     updated_speed = 0.0
 
                 actual_speed = (next_distance - vehicle.distance_along) / dt if dt > 0.0 else 0.0
-                next_progress = next_distance / lane.path.length
-                tangent = lane.path.tangent_at_distance(next_distance)
-
-                vehicle.position = lane.path.point_at_distance(next_distance)
-                vehicle.distance_along = next_distance
-                vehicle.progress = next_progress
-                vehicle.heading = math.atan2(tangent.x, tangent.y)
-                vehicle.velocity_x = tangent.x * actual_speed
-                vehicle.velocity_y = tangent.y * actual_speed
+                self._apply_vehicle_pose(
+                    vehicle,
+                    lane,
+                    next_distance,
+                    speed=actual_speed,
+                )
                 vehicle.speed = actual_speed
                 vehicle.state = "MOVING" if actual_speed > MIN_MOVEMENT_STEP else "STOPPED"
                 vehicle.wait_time = vehicle.wait_time + dt if vehicle.state == "STOPPED" else 0.0

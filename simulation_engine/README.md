@@ -9,6 +9,7 @@ Responsibilities:
 - stop-line enforcement before zebra crossings
 - protected pedestrian all-red phase
 - analytical quarter-circle turning motion
+- free-slip left-turn lanes with merge control
 - live metrics and event generation
 
 Run validation:

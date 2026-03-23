@@ -20,7 +20,7 @@ export default function AppShell({ connectionState, snapshot, children }) {
           <p className="text-xs uppercase tracking-[0.34em] text-cyan-300">Urban Mobility Digital Twin</p>
           <h1 className="mt-3 text-4xl font-semibold tracking-tight text-white">Realtime Traffic Intelligence Platform</h1>
           <p className="mt-3 max-w-2xl text-sm leading-7 text-slate-300">
-            Deterministic one-direction control with one signal per approach, strict straight and right lane discipline,
+            Deterministic one-direction control with one signal per approach, straight and right main-lane discipline,
             left turns disabled, and a buffered 3D render loop tuned for stable operator use.
           </p>
         </div>

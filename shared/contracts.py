@@ -15,9 +15,9 @@ ActorState = Literal["MOVING", "STOPPED"]
 PedestrianState = Literal["WAITING", "CROSSING", "EXITING"]
 VehicleKind = Literal["car", "ambulance", "firetruck", "police"]
 AiMode = Literal["fixed", "adaptive", "emergency", "pedestrian"]
-RouteType = Literal["straight", "right"]
+RouteType = Literal["straight", "right", "left"]
 LaneKind = Literal["main", "slip"]
-LaneMovement = Literal["STRAIGHT", "RIGHT"]
+LaneMovement = Literal["STRAIGHT", "RIGHT", "LEFT"]
 
 
 @dataclass
@@ -30,6 +30,8 @@ class Point2D:
 class LaneArcView:
     center: Point2D
     radius: float
+    inner_radius: float
+    outer_radius: float
     start_angle: float
     end_angle: float
     clockwise: bool

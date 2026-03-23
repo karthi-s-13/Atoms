@@ -25,6 +25,14 @@ const STRIPE_GAP = 0.55;
 const DASH_LENGTH = 3.2;
 const DASH_GAP = 2.2;
 const TURN_ARC_SAMPLES = 40;
+const SLIP_SURFACE_SEGMENTS = 72;
+const SLIP_TAPER_SEGMENTS = 10;
+const SLIP_SURFACE_LIFT = 0.02;
+const SLIP_SURFACE_COLOR = "#1f2937";
+const SLIP_SURFACE_EMISSIVE = "#111827";
+const SLIP_ROAD_EDGE_OFFSET = (LANE_WIDTH / 2) + SHOULDER;
+const SLIP_BRANCH_CENTER_OFFSET = SHOULDER + LANE_WIDTH;
+const SLIP_IN_PLACE_ROTATION = Math.PI / 2;
 
 function shortestAngleLerp(start, end, alpha) {
   let delta = end - start;
@@ -107,6 +115,150 @@ function laneLeftNormal(lane) {
   const dz = next.y - start.y;
   const length = Math.hypot(dx, dz) || 1;
   return { x: -dz / length, z: dx / length };
+}
+
+function normalize2D(dx, dy) {
+  const length = Math.hypot(dx, dy) || 1;
+  return { x: dx / length, y: dy / length };
+}
+
+function leftNormal2D(tangent) {
+  return { x: -tangent.y, y: tangent.x };
+}
+
+function offsetPoint2D(point, direction, distance) {
+  return {
+    x: point.x + (direction.x * distance),
+    y: point.y + (direction.y * distance),
+  };
+}
+
+function lerpPoint2D(start, end, alpha) {
+  return {
+    x: THREE.MathUtils.lerp(start.x, end.x, alpha),
+    y: THREE.MathUtils.lerp(start.y, end.y, alpha),
+  };
+}
+
+function rotatePoint2D(point, center, angle) {
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+  const cosAngle = Math.cos(angle);
+  const sinAngle = Math.sin(angle);
+  return {
+    x: center.x + (dx * cosAngle) - (dy * sinAngle),
+    y: center.y + (dx * sinAngle) + (dy * cosAngle),
+  };
+}
+
+function rotateDirection2D(direction, angle) {
+  const cosAngle = Math.cos(angle);
+  const sinAngle = Math.sin(angle);
+  return normalize2D(
+    (direction.x * cosAngle) - (direction.y * sinAngle),
+    (direction.x * sinAngle) + (direction.y * cosAngle),
+  );
+}
+
+function blendDirection2D(start, end, alpha) {
+  return normalize2D(
+    THREE.MathUtils.lerp(start.x, end.x, alpha),
+    THREE.MathUtils.lerp(start.y, end.y, alpha),
+  );
+}
+
+function projectAlong(point, origin, tangent) {
+  return ((point.x - origin.x) * tangent.x) + ((point.y - origin.y) * tangent.y);
+}
+
+function arcTangentFromAngle(angle, clockwise) {
+  return clockwise
+    ? { x: Math.sin(angle), y: -Math.cos(angle) }
+    : { x: -Math.sin(angle), y: Math.cos(angle) };
+}
+
+function slipLaneVectors(lane) {
+  const entryTangent = normalize2D(lane.turn_entry.x - lane.start.x, lane.turn_entry.y - lane.start.y);
+  const exitTangent = normalize2D(lane.end.x - lane.turn_exit.x, lane.end.y - lane.turn_exit.y);
+  return {
+    entryTangent,
+    exitTangent,
+    entryNormal: leftNormal2D(entryTangent),
+    exitNormal: leftNormal2D(exitTangent),
+    entryLength: Math.hypot(lane.turn_entry.x - lane.start.x, lane.turn_entry.y - lane.start.y) || 1,
+    exitLength: Math.hypot(lane.end.x - lane.turn_exit.x, lane.end.y - lane.turn_exit.y) || 1,
+  };
+}
+
+function slipBranchCenterPoint(point, lane, tangent) {
+  return rotatePoint2D(
+    offsetPoint2D(point, leftNormal2D(tangent), SLIP_BRANCH_CENTER_OFFSET),
+    lane.arc.center,
+    SLIP_IN_PLACE_ROTATION,
+  );
+}
+
+function slipVisualState(point, lane) {
+  const {
+    entryTangent,
+    exitTangent,
+    entryLength,
+    exitLength,
+  } = slipLaneVectors(lane);
+  const beforeTurn = projectAlong(point, lane.turn_entry, entryTangent) <= 0;
+  if (beforeTurn) {
+    return {
+      section: "entry",
+      alpha: THREE.MathUtils.clamp(projectAlong(point, lane.start, entryTangent) / entryLength, 0, 1),
+      tangent: entryTangent,
+    };
+  }
+
+  const afterTurn = projectAlong(point, lane.turn_exit, exitTangent) >= 0;
+  if (afterTurn) {
+    const exitProgress = THREE.MathUtils.clamp(projectAlong(point, lane.turn_exit, exitTangent) / exitLength, 0, 1);
+    return {
+      section: "exit",
+      alpha: 1 - exitProgress,
+      tangent: exitTangent,
+    };
+  }
+
+  const angle = Math.atan2(point.y - lane.arc.center.y, point.x - lane.arc.center.x);
+  return {
+    section: "arc",
+    alpha: 1,
+    tangent: arcTangentFromAngle(angle, lane.arc.clockwise),
+  };
+}
+
+function slipVisualCenterPoint(point, lane) {
+  if (!lane?.arc || !lane.turn_entry || !lane.turn_exit) {
+    return point;
+  }
+
+  const state = slipVisualState(point, lane);
+  const branchPoint = slipBranchCenterPoint(point, lane, state.tangent);
+  return state.alpha >= 1 ? branchPoint : lerpPoint2D(point, branchPoint, state.alpha);
+}
+
+function slipVisualHeading(heading, point, lane) {
+  if (!lane?.arc || !lane.turn_entry || !lane.turn_exit) {
+    return heading ?? 0;
+  }
+  const state = slipVisualState(point, lane);
+  return (heading ?? 0) + (SLIP_IN_PLACE_ROTATION * state.alpha);
+}
+
+function pushUnique2DPoint(points, point) {
+  const previous = points[points.length - 1];
+  if (!previous) {
+    points.push(point);
+    return;
+  }
+  if (Math.hypot(previous.x - point.x, previous.y - point.y) > 1e-4) {
+    points.push(point);
+  }
 }
 
 function laneForward(lane) {
@@ -402,19 +554,136 @@ function StopLine({ lanes }) {
   );
 }
 
+function SlipLaneSurface({ lane }) {
+  const geometry = useMemo(() => {
+    const localize = (point) => ({
+      x: point.x - lane.arc.center.x,
+      y: point.y - lane.arc.center.y,
+    });
+    const TAU = Math.PI * 2;
+    const normalizeAngleSpan = (value) => {
+      const span = ((value % TAU) + TAU) % TAU;
+      return span > 1e-6 ? span : TAU;
+    };
+    const angleSpan = normalizeAngleSpan(
+      lane.arc.clockwise
+        ? lane.arc.start_angle - lane.arc.end_angle
+        : lane.arc.end_angle - lane.arc.start_angle,
+    );
+    const { entryTangent, exitTangent } = slipLaneVectors(lane);
+    const outerBoundary = [];
+    const innerBoundary = [];
+    const pushBranchProfile = (centerPoint, tangent, widthRatio) => {
+      const normal = leftNormal2D(tangent);
+      const innerPoint = offsetPoint2D(centerPoint, normal, SLIP_ROAD_EDGE_OFFSET * widthRatio);
+      const outerPoint = offsetPoint2D(innerPoint, normal, LANE_WIDTH * widthRatio);
+      pushUnique2DPoint(innerBoundary, localize(innerPoint));
+      pushUnique2DPoint(outerBoundary, localize(outerPoint));
+    };
+
+    for (let index = 0; index <= SLIP_TAPER_SEGMENTS; index += 1) {
+      const ratio = index / SLIP_TAPER_SEGMENTS;
+      const point = lerpPoint2D(lane.start, lane.turn_entry, ratio);
+      const branchPoint = slipBranchCenterPoint(point, lane, entryTangent);
+      const branchTangent = rotateDirection2D(entryTangent, SLIP_IN_PLACE_ROTATION);
+      pushBranchProfile(
+        lerpPoint2D(point, branchPoint, ratio),
+        blendDirection2D(entryTangent, branchTangent, ratio),
+        ratio,
+      );
+    }
+
+    for (let index = 1; index < SLIP_SURFACE_SEGMENTS; index += 1) {
+      const ratio = index / SLIP_SURFACE_SEGMENTS;
+      const angle = lane.arc.clockwise
+        ? lane.arc.start_angle - (angleSpan * ratio)
+        : lane.arc.start_angle + (angleSpan * ratio);
+      const point = {
+        x: lane.arc.center.x + (lane.arc.radius * Math.cos(angle)),
+        y: lane.arc.center.y + (lane.arc.radius * Math.sin(angle)),
+      };
+      const tangent = arcTangentFromAngle(angle, lane.arc.clockwise);
+      pushBranchProfile(
+        slipBranchCenterPoint(point, lane, tangent),
+        rotateDirection2D(tangent, SLIP_IN_PLACE_ROTATION),
+        1,
+      );
+    }
+
+    for (let index = 0; index <= SLIP_TAPER_SEGMENTS; index += 1) {
+      const ratio = index / SLIP_TAPER_SEGMENTS;
+      const point = lerpPoint2D(lane.turn_exit, lane.end, ratio);
+      const branchPoint = slipBranchCenterPoint(point, lane, exitTangent);
+      const branchTangent = rotateDirection2D(exitTangent, SLIP_IN_PLACE_ROTATION);
+      const branchRatio = 1 - ratio;
+      pushBranchProfile(
+        lerpPoint2D(point, branchPoint, branchRatio),
+        blendDirection2D(exitTangent, branchTangent, branchRatio),
+        branchRatio,
+      );
+    }
+
+    const shape = new THREE.Shape();
+    shape.moveTo(outerBoundary[0].x, outerBoundary[0].y);
+    outerBoundary.slice(1).forEach((point) => {
+      shape.lineTo(point.x, point.y);
+    });
+    innerBoundary.slice().reverse().forEach((point) => {
+      shape.lineTo(point.x, point.y);
+    });
+    shape.closePath();
+    return new THREE.ShapeGeometry(shape, SLIP_SURFACE_SEGMENTS);
+  }, [
+    lane.end.x,
+    lane.end.y,
+    lane.arc.center.x,
+    lane.arc.center.y,
+    lane.arc.clockwise,
+    lane.arc.end_angle,
+    lane.arc.start_angle,
+    lane.start.x,
+    lane.start.y,
+    lane.turn_entry.x,
+    lane.turn_entry.y,
+    lane.turn_exit.x,
+    lane.turn_exit.y,
+  ]);
+
+  useEffect(() => () => geometry.dispose(), [geometry]);
+
+  return (
+    <mesh position={[lane.arc.center.x, SLIP_SURFACE_LIFT, lane.arc.center.y]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+      <primitive object={geometry} attach="geometry" />
+      <meshStandardMaterial
+        color={SLIP_SURFACE_COLOR}
+        emissive={SLIP_SURFACE_EMISSIVE}
+        emissiveIntensity={0.08}
+        roughness={0.96}
+        metalness={0.05}
+        side={THREE.DoubleSide}
+        polygonOffset
+        polygonOffsetFactor={-2}
+        polygonOffsetUnits={-2}
+      />
+    </mesh>
+  );
+}
+
 function PathDebugLine({ lane }) {
   const points = useMemo(() => laneDebugPoints(lane), [lane]);
-  const color = lane.movement === "RIGHT" ? "#f59e0b" : "#7dd3fc";
+  const color = lane.movement === "RIGHT" ? "#f59e0b" : lane.movement === "LEFT" ? "#34d399" : "#7dd3fc";
   return <Line points={points} color={color} transparent opacity={0.28} lineWidth={1.4} />;
 }
 
 function RoadNetwork({ lanes, crosswalks, pedestrians, signals }) {
   const stripes = useMemo(() => dividerSegments(), []);
+  const mainLanes = useMemo(() => lanes.filter((lane) => lane.kind !== "slip"), [lanes]);
+  const slipLanes = useMemo(() => lanes.filter((lane) => lane.kind === "slip" && lane.arc), [lanes]);
   const activeCrosswalkIds = useMemo(
     () => new Set(pedestrians.filter((pedestrian) => pedestrian.state === "CROSSING").map((pedestrian) => pedestrian.crosswalk_id)),
     [pedestrians],
   );
-  const lanesByApproach = lanes.reduce((groups, lane) => {
+  const lanesByApproach = mainLanes.reduce((groups, lane) => {
     groups[lane.approach] = groups[lane.approach] ?? [];
     groups[lane.approach].push(lane);
     return groups;
@@ -460,8 +729,8 @@ function RoadNetwork({ lanes, crosswalks, pedestrians, signals }) {
         <SurfaceStripe key={segment.id} segment={segment} />
       ))}
 
-      {lanes.map((lane) => (
-        <PathDebugLine key={`path-${lane.id}`} lane={lane} />
+      {slipLanes.map((lane) => (
+        <SlipLaneSurface key={`slip-surface-${lane.id}`} lane={lane} />
       ))}
 
       {crosswalks.map((crosswalk) => (
@@ -513,7 +782,7 @@ function VehicleShell({ vehicle, appearance }) {
   );
 }
 
-function VehicleActor({ id, sceneBufferRef, initial }) {
+function VehicleActor({ id, laneMap, sceneBufferRef, initial }) {
   const groupRef = useRef();
 
   useFrame(() => {
@@ -521,8 +790,10 @@ function VehicleActor({ id, sceneBufferRef, initial }) {
     if (!sampled || !groupRef.current) {
       return;
     }
-    groupRef.current.position.set(sampled.x, 0.9, sampled.y);
-    groupRef.current.rotation.y = sampled.heading ?? 0;
+    const lane = laneMap[sampled.lane_id];
+    const renderPoint = lane?.kind === "slip" ? slipVisualCenterPoint({ x: sampled.x, y: sampled.y }, lane) : sampled;
+    groupRef.current.position.set(renderPoint.x, 0.9, renderPoint.y);
+    groupRef.current.rotation.y = lane?.kind === "slip" ? slipVisualHeading(sampled.heading, { x: sampled.x, y: sampled.y }, lane) : (sampled.heading ?? 0);
   });
 
   if (!initial) {
@@ -530,9 +801,12 @@ function VehicleActor({ id, sceneBufferRef, initial }) {
   }
 
   const appearance = vehicleAppearance(initial);
+  const initialLane = laneMap[initial.lane_id];
+  const initialPoint = initialLane?.kind === "slip" ? slipVisualCenterPoint({ x: initial.x, y: initial.y }, initialLane) : initial;
+  const initialHeading = initialLane?.kind === "slip" ? slipVisualHeading(initial.heading, { x: initial.x, y: initial.y }, initialLane) : (initial.heading ?? 0);
 
   return (
-    <group ref={groupRef} position={[initial.x, 0.9, initial.y]} rotation={[0, initial.heading ?? 0, 0]}>
+    <group ref={groupRef} position={[initialPoint.x, 0.9, initialPoint.y]} rotation={[0, initialHeading, 0]}>
       <mesh position={[0, -0.86, 0]} rotation={[-Math.PI / 2, 0, 0]} scale={appearance.shadowScale}>
         <circleGeometry args={[1, 24]} />
         <meshBasicMaterial color="#020617" transparent opacity={0.24} />
@@ -611,6 +885,11 @@ function PedestrianActor({ id, sceneBufferRef, initial }) {
 }
 
 export default function SimulationCanvas({ sceneSnapshot, sceneBufferRef, cameraStateRef }) {
+  const laneMap = useMemo(
+    () => Object.fromEntries(sceneSnapshot.lanes.map((lane) => [lane.id, lane])),
+    [sceneSnapshot.lanes],
+  );
+
   return (
     <div className="glass-panel h-[680px] overflow-hidden rounded-[2rem]">
       <Canvas shadows camera={{ position: cameraStateRef.current.position, fov: 42 }}>
@@ -635,7 +914,7 @@ export default function SimulationCanvas({ sceneSnapshot, sceneBufferRef, camera
         />
 
         {sceneSnapshot.vehicles.map((vehicle) => (
-          <VehicleActor key={vehicle.id} id={vehicle.id} sceneBufferRef={sceneBufferRef} initial={vehicle} />
+          <VehicleActor key={vehicle.id} id={vehicle.id} laneMap={laneMap} sceneBufferRef={sceneBufferRef} initial={vehicle} />
         ))}
 
         {sceneSnapshot.pedestrians.map((pedestrian) => (

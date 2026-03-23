@@ -7,9 +7,9 @@ export type ActorState = "MOVING" | "STOPPED";
 export type PedestrianState = "WAITING" | "CROSSING" | "EXITING";
 export type VehicleKind = "car" | "ambulance" | "firetruck" | "police";
 export type AiMode = "fixed" | "adaptive" | "emergency" | "pedestrian";
-export type RouteType = "straight" | "right";
+export type RouteType = "straight" | "right" | "left";
 export type LaneKind = "main" | "slip";
-export type LaneMovement = "STRAIGHT" | "RIGHT";
+export type LaneMovement = "STRAIGHT" | "RIGHT" | "LEFT";
 
 export interface Point2D {
   x: number;
@@ -19,6 +19,8 @@ export interface Point2D {
 export interface LaneArcView {
   center: Point2D;
   radius: number;
+  inner_radius: number;
+  outer_radius: number;
   start_angle: number;
   end_angle: number;
   clockwise: boolean;

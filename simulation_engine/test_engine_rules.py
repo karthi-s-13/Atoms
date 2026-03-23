@@ -6,12 +6,16 @@ import math
 import unittest
 
 from simulation_engine.engine import (
+    CROSSWALK_OUTER_OFFSET,
     EAST,
     GREEN_INTERVAL,
     INNER_LANE_OFFSET,
     INTERSECTION_HALF_SIZE,
+    LANE_WIDTH,
     NORTH,
     PHASE_GREEN,
+    SLIP_TRANSITION_LENGTH,
+    SLIP_TURN_RADIUS,
     SOUTH,
     WEST,
     TrafficSimulationEngine,
@@ -19,6 +23,30 @@ from simulation_engine.engine import (
 
 
 class TrafficSimulationEngineTest(unittest.TestCase):
+    @staticmethod
+    def _left_normal(x: float, y: float) -> tuple[float, float]:
+        return (-y, x)
+
+    @staticmethod
+    def _offset(x: float, y: float, direction_x: float, direction_y: float, distance: float) -> tuple[float, float]:
+        return (x + (direction_x * distance), y + (direction_y * distance))
+
+    @staticmethod
+    def _line_intersection(
+        origin_a: tuple[float, float],
+        direction_a: tuple[float, float],
+        origin_b: tuple[float, float],
+        direction_b: tuple[float, float],
+    ) -> tuple[float, float]:
+        determinant = (direction_a[0] * direction_b[1]) - (direction_a[1] * direction_b[0])
+        delta_x = origin_b[0] - origin_a[0]
+        delta_y = origin_b[1] - origin_a[1]
+        t = ((delta_x * direction_b[1]) - (delta_y * direction_b[0])) / determinant
+        return (
+            origin_a[0] + (direction_a[0] * t),
+            origin_a[1] + (direction_a[1] * t),
+        )
+
     def setUp(self) -> None:
         self.engine = TrafficSimulationEngine()
         self.engine.vehicles = []
@@ -41,13 +69,29 @@ class TrafficSimulationEngineTest(unittest.TestCase):
     ):
         vehicle = self.engine._make_vehicle(approach, route)
         lane = self.engine.lanes[vehicle.lane_id]
-        vehicle.distance_along = max(0.0, lane.stop_distance - distance_before_stop)
-        vehicle.position = lane.path.point_at_distance(vehicle.distance_along)
-        vehicle.progress = vehicle.distance_along / lane.path.length
+        distance_along = max(0.0, lane.stop_distance - distance_before_stop)
+        resolved_speed = vehicle.cruise_speed if speed is None else speed
+        self.engine._apply_vehicle_pose(vehicle, lane, distance_along, speed=resolved_speed)
         vehicle.wait_time = wait_time
-        vehicle.speed = vehicle.cruise_speed if speed is None else speed
+        vehicle.speed = resolved_speed
         vehicle.state = "STOPPED" if wait_time > 0 else "MOVING"
         return vehicle
+
+    def _set_vehicle_distance(
+        self,
+        vehicle,
+        distance_along: float,
+        *,
+        speed: float | None = None,
+        state: str | None = None,
+    ) -> None:
+        lane = self.engine.lanes[vehicle.lane_id]
+        resolved_speed = vehicle.cruise_speed if speed is None else speed
+        clamped_distance = max(0.0, min(distance_along, lane.path.length))
+        self.engine._apply_vehicle_pose(vehicle, lane, clamped_distance, speed=resolved_speed)
+        vehicle.speed = resolved_speed
+        vehicle.state = state or ("MOVING" if resolved_speed > 0 else "STOPPED")
+        vehicle.wait_time = 0.0
 
     def test_initial_snapshot_has_one_green_and_no_pedestrians(self) -> None:
         snapshot = self.engine.snapshot().to_dict()
@@ -91,6 +135,7 @@ class TrafficSimulationEngineTest(unittest.TestCase):
     def test_lane_assignment_matches_vehicle_intent(self) -> None:
         straight_vehicle = self.engine._make_vehicle("NORTH", "straight")
         right_vehicle = self.engine._make_vehicle("NORTH", "right")
+        left_vehicle = self.engine._make_vehicle("NORTH", "left")
 
         self.assertEqual(straight_vehicle.route, "straight")
         self.assertEqual(straight_vehicle.lane_id, "lane_north_straight")
@@ -100,7 +145,9 @@ class TrafficSimulationEngineTest(unittest.TestCase):
         self.assertEqual(right_vehicle.lane_id, "lane_north_right")
         self.assertEqual(self.engine.lanes[right_vehicle.lane_id].lane_index, "inner")
 
-        self.assertEqual(self.engine._lane_ids_for_route("NORTH", "left"), [])
+        self.assertEqual(left_vehicle.route, "left")
+        self.assertEqual(left_vehicle.lane_id, "lane_north_left_slip")
+        self.assertEqual(self.engine.lanes[left_vehicle.lane_id].kind, "slip")
 
     def test_cycle_order_is_north_east_south_west(self) -> None:
         self._set_green(NORTH, elapsed=GREEN_INTERVAL)
@@ -178,6 +225,159 @@ class TrafficSimulationEngineTest(unittest.TestCase):
         self.assertLess(vehicle.position.x, start_x)
         self.assertLess(vehicle.position.y, start_y)
 
+    def test_left_slip_lanes_are_lane_connected_and_symmetric(self) -> None:
+        outgoing_lane_ids = {
+            "NORTH": "lane_west_straight",
+            "EAST": "lane_north_straight",
+            "SOUTH": "lane_east_straight",
+            "WEST": "lane_south_straight",
+        }
+
+        for approach, outgoing_lane_id in outgoing_lane_ids.items():
+            lane = self.engine.lanes[f"lane_{approach.lower()}_left_slip"]
+            incoming_lane = self.engine.lanes[f"lane_{approach.lower()}_straight"]
+            outgoing_lane = self.engine.lanes[outgoing_lane_id]
+
+            incoming_direction = incoming_lane.path.tangent_at_distance(0.0)
+            outgoing_direction = outgoing_lane.path.tangent_at_distance(0.0)
+            incoming_normal = self._left_normal(incoming_direction.x, incoming_direction.y)
+            outgoing_normal = self._left_normal(outgoing_direction.x, outgoing_direction.y)
+            expected_entry = (
+                incoming_lane.path.point_at_distance(incoming_lane.queue_release_distance).x,
+                incoming_lane.path.point_at_distance(incoming_lane.queue_release_distance).y,
+            )
+            expected_exit = (
+                outgoing_lane.path.point_at_distance(outgoing_lane.merge_distance).x,
+                outgoing_lane.path.point_at_distance(outgoing_lane.merge_distance).y,
+            )
+            expected_center = self._line_intersection(
+                expected_entry,
+                incoming_normal,
+                expected_exit,
+                outgoing_normal,
+            )
+
+            self.assertEqual(lane.kind, "slip")
+            self.assertEqual(lane.movement, "LEFT")
+            self.assertEqual(len(lane.path.points), 4)
+            self.assertIsNotNone(lane.arc)
+            self.assertIsNotNone(lane.turn_entry)
+            self.assertIsNotNone(lane.turn_exit)
+            self.assertFalse(lane.arc.clockwise)
+            self.assertEqual(lane.turn_entry, lane.path.points[1])
+            self.assertEqual(lane.turn_exit, lane.path.points[2])
+            self.assertEqual(lane.stop_crosswalk_id, outgoing_lane.stop_crosswalk_id)
+            self.assertEqual(lane.merge_group, outgoing_lane.id)
+
+            self.assertAlmostEqual(lane.arc.center.x, expected_center[0], places=6)
+            self.assertAlmostEqual(lane.arc.center.y, expected_center[1], places=6)
+            self.assertAlmostEqual(lane.turn_entry.x, expected_entry[0], places=6)
+            self.assertAlmostEqual(lane.turn_entry.y, expected_entry[1], places=6)
+            self.assertAlmostEqual(lane.turn_exit.x, expected_exit[0], places=6)
+            self.assertAlmostEqual(lane.turn_exit.y, expected_exit[1], places=6)
+            self.assertAlmostEqual(lane.arc.radius, SLIP_TURN_RADIUS, places=6)
+            self.assertAlmostEqual(lane.arc.inner_radius, SLIP_TURN_RADIUS - (LANE_WIDTH / 2.0), places=6)
+            self.assertAlmostEqual(lane.arc.outer_radius, SLIP_TURN_RADIUS + (LANE_WIDTH / 2.0), places=6)
+            self.assertAlmostEqual(lane.arc.outer_radius - lane.arc.inner_radius, LANE_WIDTH, places=6)
+            self.assertAlmostEqual(lane.path.entry_length, SLIP_TRANSITION_LENGTH, places=6)
+            self.assertAlmostEqual(lane.path.exit_length, SLIP_TRANSITION_LENGTH, places=6)
+            expected_length = (SLIP_TRANSITION_LENGTH * 2.0) + (lane.arc.radius * (math.pi / 2.0))
+            self.assertAlmostEqual(lane.path.length, expected_length, places=6)
+
+            start_tangent = lane.path.tangent_at_distance(0.0)
+            arc_start_tangent = lane.path.tangent_at_distance(lane.path.entry_length)
+            arc_end_tangent = lane.path.tangent_at_distance(lane.path.entry_length + lane.path.arc.length)
+            end_tangent = lane.path.tangent_at_distance(lane.path.length)
+            self.assertAlmostEqual(start_tangent.x, incoming_direction.x, places=5)
+            self.assertAlmostEqual(start_tangent.y, incoming_direction.y, places=5)
+            self.assertAlmostEqual(arc_start_tangent.x, incoming_direction.x, places=5)
+            self.assertAlmostEqual(arc_start_tangent.y, incoming_direction.y, places=5)
+            self.assertAlmostEqual(arc_end_tangent.x, outgoing_direction.x, places=5)
+            self.assertAlmostEqual(arc_end_tangent.y, outgoing_direction.y, places=5)
+            self.assertAlmostEqual(end_tangent.x, outgoing_direction.x, places=5)
+            self.assertAlmostEqual(end_tangent.y, outgoing_direction.y, places=5)
+
+            entry_margin = (
+                ((lane.turn_entry.x - incoming_lane.crosswalk_start.x) * -incoming_direction.x)
+                + ((lane.turn_entry.y - incoming_lane.crosswalk_start.y) * -incoming_direction.y)
+            )
+            self.assertGreater(entry_margin, 0.0)
+            self.assertGreater(entry_margin, CROSSWALK_OUTER_OFFSET - INTERSECTION_HALF_SIZE)
+
+            self.assertLess(
+                abs(
+                    ((lane.turn_entry.x - incoming_lane.path.points[0].x) * incoming_normal[0])
+                    + ((lane.turn_entry.y - incoming_lane.path.points[0].y) * incoming_normal[1])
+                ),
+                1e-6,
+            )
+            self.assertLess(
+                abs(
+                    ((lane.turn_exit.x - outgoing_lane.path.points[0].x) * outgoing_normal[0])
+                    + ((lane.turn_exit.y - outgoing_lane.path.points[0].y) * outgoing_normal[1])
+                ),
+                1e-6,
+            )
+
+            for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+                arc_distance = lane.path.arc.length * fraction
+                point = lane.path.point_at_distance(lane.path.entry_length + arc_distance)
+                radius = math.hypot(point.x - lane.arc.center.x, point.y - lane.arc.center.y)
+                self.assertAlmostEqual(radius, lane.arc.radius, places=5)
+                angle = lane.path.arc.angle_at_distance(arc_distance)
+                inner_edge = (
+                    lane.arc.center.x + (lane.arc.inner_radius * math.cos(angle)),
+                    lane.arc.center.y + (lane.arc.inner_radius * math.sin(angle)),
+                )
+                self.assertTrue(
+                    abs(inner_edge[0]) >= INTERSECTION_HALF_SIZE - 1e-6
+                    or abs(inner_edge[1]) >= INTERSECTION_HALF_SIZE - 1e-6,
+                )
+
+    def test_left_slip_lane_ignores_signal_and_bypasses_stop_line(self) -> None:
+        vehicle = self.engine._make_vehicle("NORTH", "left")
+        lane = self.engine.lanes[vehicle.lane_id]
+        start_distance = lane.path.entry_length * 0.5
+        self._set_vehicle_distance(vehicle, start_distance, speed=vehicle.cruise_speed)
+        self.engine.vehicles = [vehicle]
+        self._set_green(SOUTH)
+
+        for _ in range(6):
+            self.engine.update_vehicles(0.25)
+
+        self.assertGreater(vehicle.distance_along, start_distance + 4.0)
+        self.assertGreaterEqual(vehicle.position.x, INTERSECTION_HALF_SIZE - 1e-6)
+        self.assertLess(vehicle.position.y, lane.path.points[0].y)
+
+    def test_left_slip_lane_vehicle_pose_matches_arc_equation(self) -> None:
+        vehicle = self.engine._make_vehicle("NORTH", "left")
+        lane = self.engine.lanes[vehicle.lane_id]
+        self._set_vehicle_distance(
+            vehicle,
+            lane.path.entry_length + (lane.path.arc.length * 0.35),
+            speed=vehicle.cruise_speed,
+        )
+        self.engine.vehicles = [vehicle]
+        self._set_green(WEST)
+
+        self.engine.update_vehicles(0.2)
+
+        self.assertIsNotNone(vehicle.arc_angle)
+        self.assertIsNotNone(vehicle.arc_radius)
+        self.assertIsNotNone(vehicle.arc_center)
+        self.assertAlmostEqual(vehicle.arc_radius, lane.arc.radius, places=6)
+        self.assertAlmostEqual(vehicle.arc_center.x, lane.arc.center.x, places=6)
+        self.assertAlmostEqual(vehicle.arc_center.y, lane.arc.center.y, places=6)
+
+        expected_x = vehicle.arc_center.x + (vehicle.arc_radius * math.cos(vehicle.arc_angle))
+        expected_y = vehicle.arc_center.y + (vehicle.arc_radius * math.sin(vehicle.arc_angle))
+        self.assertAlmostEqual(vehicle.position.x, expected_x, places=5)
+        self.assertAlmostEqual(vehicle.position.y, expected_y, places=5)
+        arc_distance = vehicle.distance_along - lane.path.entry_length
+        self.assertAlmostEqual(vehicle.heading, lane.path.arc.heading_at_distance(arc_distance), places=5)
+        self.assertGreaterEqual(vehicle.position.x, lane.turn_entry.x)
+        self.assertGreaterEqual(vehicle.position.y, lane.turn_exit.y)
+
     def test_straight_lane_stays_in_outer_lane_under_active_green(self) -> None:
         lane = self.engine.lanes["lane_north_straight"]
         self.assertEqual(lane.lane_index, "outer")
@@ -194,15 +394,15 @@ class TrafficSimulationEngineTest(unittest.TestCase):
         self.assertAlmostEqual(vehicle.position.x, start_x, places=2)
         self.assertLess(vehicle.position.y, start_y)
 
-    def test_only_straight_and_right_routes_exist(self) -> None:
+    def test_all_supported_vehicle_routes_exist(self) -> None:
         routes = set()
-        for route in ("straight", "right"):
+        for route in ("straight", "right", "left"):
             vehicle = self.engine._make_vehicle("EAST", route)
             routes.add(vehicle.route)
-        self.assertEqual(routes, {"straight", "right"})
+        self.assertEqual(routes, {"straight", "right", "left"})
         self.assertEqual(self.engine._lane_ids_for_route("NORTH", "straight"), ["lane_north_straight"])
         self.assertEqual(self.engine._lane_ids_for_route("NORTH", "right"), ["lane_north_right"])
-        self.assertEqual(self.engine._lane_ids_for_route("NORTH", "left"), [])
+        self.assertEqual(self.engine._lane_ids_for_route("NORTH", "left"), ["lane_north_left_slip"])
 
     def test_following_vehicle_does_not_overlap_leader(self) -> None:
         leader = self._make_vehicle("NORTH", "straight", distance_before_stop=0.5, speed=0.0)
@@ -226,6 +426,31 @@ class TrafficSimulationEngineTest(unittest.TestCase):
         self.assertLess(follower.distance_along, leader.distance_along)
         spacing = math.hypot(leader.position.x - follower.position.x, leader.position.y - follower.position.y)
         self.assertGreaterEqual(spacing, (leader.length + follower.length) / 2.0)
+
+    def test_left_slip_lane_waits_for_merge_gap_then_proceeds(self) -> None:
+        slip_vehicle = self.engine._make_vehicle("NORTH", "left")
+        slip_lane = self.engine.lanes[slip_vehicle.lane_id]
+        self.assertIsNotNone(slip_lane.merge_distance)
+        self._set_vehicle_distance(slip_vehicle, slip_lane.merge_distance - 1.4, speed=slip_vehicle.cruise_speed)
+
+        blocker = self.engine._make_vehicle("WEST", "straight")
+        blocker_lane = self.engine.lanes[blocker.lane_id]
+        self.assertIsNotNone(blocker_lane.merge_distance)
+        blocker_speed = blocker.cruise_speed
+        blocker.cruise_speed = 0.0
+        self._set_vehicle_distance(blocker, blocker_lane.merge_distance + 2.0, speed=0.0, state="STOPPED")
+
+        self.engine.vehicles = [slip_vehicle, blocker]
+        self._set_green(SOUTH)
+
+        self.engine.update_vehicles(0.6)
+        self.assertLess(slip_vehicle.distance_along, slip_lane.merge_distance)
+
+        blocker.cruise_speed = blocker_speed
+        self._set_vehicle_distance(blocker, blocker_lane.merge_distance + 18.0, speed=blocker_speed)
+
+        self.engine.update_vehicles(0.8)
+        self.assertGreaterEqual(slip_vehicle.distance_along, slip_lane.merge_distance)
 
     def test_pedestrian_waits_until_allowed_and_then_completes_crossing(self) -> None:
         self.engine.config.max_pedestrians = 1

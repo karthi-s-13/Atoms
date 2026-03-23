@@ -50,7 +50,7 @@ export default function HomePage({ snapshot, connectionState }) {
         <div className="glass-panel rounded-[2rem] p-8">
           <p className="panel-title">System Overview</p>
           <div className="mt-5 space-y-4 text-sm leading-7 text-slate-300">
-            <p>Simulation Engine: path-following cars, one green direction at a time, a dedicated straight lane, a dedicated right-turn lane, and stop-line enforcement before every zebra crossing.</p>
+            <p>Simulation Engine: path-following cars, one green direction at a time, a dedicated straight lane, a dedicated right-turn lane, free-slip left-turn channels, and stop-line enforcement before every zebra crossing on the signalized lanes.</p>
             <p>Realtime Server: authoritative 60 FPS clock, websocket streaming, health endpoint, and control acknowledgements.</p>
             <p>Frontend: buffered interpolation, persistent camera, operator controls, analytics dashboard, and impact modeling.</p>
           </div>
