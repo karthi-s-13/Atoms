@@ -10,6 +10,7 @@ const navItems = [
   { to: "/dashboard", label: "Dashboard" },
   { to: "/impact", label: "Impact" },
   { to: "/live-cv", label: "Live CV" },
+  { to: "/map", label: "Map" },
 ];
 
 export default function AppShell({ connectionState, snapshot, children }) {
