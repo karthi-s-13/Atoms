@@ -978,7 +978,6 @@ class TrafficSimulationEngine:
             )
 
         def add_slip_lane(approach: Approach) -> None:
-            """Create a simple polyline-based free left-turn slip lane."""
             incoming_lane_id = f"lane_{approach.lower()}_straight"
             exit_direction = _left_turn_exit(approach)
             outgoing_approach = _opposite_approach(exit_direction)
@@ -986,48 +985,36 @@ class TrafficSimulationEngine:
             incoming_lane = lanes[incoming_lane_id]
             outgoing_lane = lanes[outgoing_lane_id]
 
-            # Get entry and exit points from the lanes
-            turn_entry = incoming_lane.path.point_at_distance(
-                incoming_lane.queue_release_distance
-            )
-            turn_exit = outgoing_lane.path.point_at_distance(
-                outgoing_lane.merge_distance
-            )
-            if outgoing_lane.merge_distance is None:
-                raise ValueError(
-                    f"Missing merge point for slip-lane destination {outgoing_lane_id}."
-                )
-
-            # Get directions for smooth transitions
             incoming_direction = incoming_lane.path.tangent_at_distance(0.0)
             outgoing_direction = outgoing_lane.path.tangent_at_distance(0.0)
+            incoming_normal = _left_normal(incoming_direction)
+            outgoing_normal = _left_normal(outgoing_direction)
+            if outgoing_lane.merge_distance is None:
+                raise ValueError(f"Missing merge point for slip-lane destination {outgoing_lane_id}.")
 
-            # Create extended entry and exit points
+            turn_entry = incoming_lane.path.point_at_distance(incoming_lane.queue_release_distance)
+            turn_exit = outgoing_lane.path.point_at_distance(outgoing_lane.merge_distance)
+            arc_center = _line_intersection(
+                turn_entry,
+                incoming_normal,
+                turn_exit,
+                outgoing_normal,
+            )
             entry_start = _offset_point(turn_entry, incoming_direction, -SLIP_TRANSITION_LENGTH)
             exit_end = _offset_point(turn_exit, outgoing_direction, SLIP_TRANSITION_LENGTH)
-
-            # Create simple polyline path with waypoints
-            # The path curves gently from entry to exit via intermediate waypoints
-            mid_point_x = (turn_entry.x + turn_exit.x) / 2.0
-            mid_point_y = (turn_entry.y + turn_exit.y) / 2.0
-            
-            # Add offset perpendicular to create smooth curve
-            offset_x = (turn_exit.y - turn_entry.y) / 2.0
-            offset_y = (turn_entry.x - turn_exit.x) / 2.0
-            
-            mid_point = Point2D(mid_point_x + offset_x * 0.3, mid_point_y + offset_y * 0.3)
-            
-            # Simple 5-point polyline: entry -> turn_entry -> mid -> turn_exit -> exit
-            path_points = (
+            arc = CircularArc.from_center(
+                arc_center,
+                turn_entry,
+                turn_exit,
+                clockwise=False,
+            )
+            path = TurnArcPath.from_points(
                 entry_start,
                 turn_entry,
-                mid_point,
+                arc,
                 turn_exit,
                 exit_end,
             )
-            
-            path = PolylinePath.from_points(path_points)
-
             lane_id = f"lane_{approach.lower()}_left_slip"
             lanes[lane_id] = LaneDefinition(
                 id=lane_id,
@@ -1038,15 +1025,78 @@ class TrafficSimulationEngine:
                 movement_id=f"{approach[0]}_LEFT",
                 path=path,
                 stop_line_position=turn_entry,
-                stop_distance=_distance(entry_start, turn_entry),
+                stop_distance=path.entry_length,
                 stop_crosswalk_id=outgoing_lane.stop_crosswalk_id,
                 crosswalk_start=turn_entry,
                 queue_group=lane_id,
-                queue_release_distance=_distance(entry_start, turn_entry) + path.length * 0.3,
+                queue_release_distance=path.entry_length + arc.length,
                 merge_group=outgoing_lane_id,
                 merge_distance=path.length,
+                arc=arc.to_view(),
+                turn_entry=turn_entry,
+                turn_exit=turn_exit,
             )
 
+        add_arc_lane(
+            "lane_north_right",
+            "NORTH",
+            "inner",
+            "RIGHT",
+            Point2D(INNER_LANE_OFFSET, PATH_ENTRY_OFFSET),
+            Point2D(INNER_LANE_OFFSET, STOP_OFFSET),
+            Point2D(INNER_LANE_OFFSET, INTERSECTION_HALF_SIZE),
+            Point2D(-INTERSECTION_HALF_SIZE, INTERSECTION_HALF_SIZE),
+            Point2D(-INTERSECTION_HALF_SIZE, -INNER_LANE_OFFSET),
+            Point2D(-PATH_EXIT_OFFSET, -INNER_LANE_OFFSET),
+            "north_crosswalk",
+            Point2D(INNER_LANE_OFFSET, CROSSWALK_OUTER_OFFSET),
+            "lane_north_right",
+        )
+        add_arc_lane(
+            "lane_south_right",
+            "SOUTH",
+            "inner",
+            "RIGHT",
+            Point2D(-INNER_LANE_OFFSET, -PATH_ENTRY_OFFSET),
+            Point2D(-INNER_LANE_OFFSET, -STOP_OFFSET),
+            Point2D(-INNER_LANE_OFFSET, -INTERSECTION_HALF_SIZE),
+            Point2D(INTERSECTION_HALF_SIZE, -INTERSECTION_HALF_SIZE),
+            Point2D(INTERSECTION_HALF_SIZE, INNER_LANE_OFFSET),
+            Point2D(PATH_EXIT_OFFSET, INNER_LANE_OFFSET),
+            "south_crosswalk",
+            Point2D(-INNER_LANE_OFFSET, -CROSSWALK_OUTER_OFFSET),
+            "lane_south_right",
+        )
+        add_arc_lane(
+            "lane_east_right",
+            "EAST",
+            "inner",
+            "RIGHT",
+            Point2D(PATH_ENTRY_OFFSET, -INNER_LANE_OFFSET),
+            Point2D(STOP_OFFSET, -INNER_LANE_OFFSET),
+            Point2D(INTERSECTION_HALF_SIZE, -INNER_LANE_OFFSET),
+            Point2D(INTERSECTION_HALF_SIZE, INTERSECTION_HALF_SIZE),
+            Point2D(-INNER_LANE_OFFSET, INTERSECTION_HALF_SIZE),
+            Point2D(-INNER_LANE_OFFSET, PATH_EXIT_OFFSET),
+            "east_crosswalk",
+            Point2D(CROSSWALK_OUTER_OFFSET, -INNER_LANE_OFFSET),
+            "lane_east_right",
+        )
+        add_arc_lane(
+            "lane_west_right",
+            "WEST",
+            "inner",
+            "RIGHT",
+            Point2D(-PATH_ENTRY_OFFSET, INNER_LANE_OFFSET),
+            Point2D(-STOP_OFFSET, INNER_LANE_OFFSET),
+            Point2D(-INTERSECTION_HALF_SIZE, INNER_LANE_OFFSET),
+            Point2D(-INTERSECTION_HALF_SIZE, -INTERSECTION_HALF_SIZE),
+            Point2D(INNER_LANE_OFFSET, -INTERSECTION_HALF_SIZE),
+            Point2D(INNER_LANE_OFFSET, -PATH_EXIT_OFFSET),
+            "west_crosswalk",
+            Point2D(-CROSSWALK_OUTER_OFFSET, INNER_LANE_OFFSET),
+            "lane_west_right",
+        )
         for approach in SIGNAL_ORDER:
             add_slip_lane(approach)
         return lanes
