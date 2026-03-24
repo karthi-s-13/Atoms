@@ -37,6 +37,7 @@ const DEFAULT_DECISION = {
   signal_states: { north: "red", south: "red", east: "red", west: "red" },
   cycle_plan: { green_duration_sec: 0, amber_duration_sec: 0, all_red_duration_sec: 0 },
   rationale: "Analyze at least one direction to recommend a safe junction phase plan.",
+  controller: { phase_action: "idle", last_green_direction: null, elapsed_green_sec: 0, fairness_cycles: {}, starvation_watch: [] },
   approaches: {},
 };
 
@@ -428,9 +429,17 @@ export default function LiveCvPage() {
                   <span className="rounded-full border border-white/10 px-3 py-1 text-[11px] uppercase tracking-[0.22em] text-white">{layoutMode === "single" ? "active" : decision.signal_states[key] || "red"}</span>
                 </div>
                 <p className="mt-3 text-sm">{layoutMode === "single" ? "Priority value" : "Effective priority"}: <span className="font-semibold text-white">{layoutMode === "single" ? approaches[key].stats.signalPriorityValue : decision.approaches?.[key]?.effective_priority ?? 0}</span></p>
+                {layoutMode === "junction" ? <p className="mt-2 text-sm">Fairness cycles: <span className="font-semibold text-white">{decision.controller?.fairness_cycles?.[key] ?? 0}</span></p> : null}
               </div>
             ))}
           </div>
+          {layoutMode === "junction" ? (
+            <div className="mt-5 rounded-3xl border border-white/10 bg-white/[0.04] px-5 py-4 text-sm text-slate-300">
+              <p>Phase action: <span className="font-medium uppercase text-white">{String(decision.controller?.phase_action || "idle").replaceAll("_", " ")}</span></p>
+              <p className="mt-2">Elapsed green: <span className="font-medium text-white">{decision.controller?.elapsed_green_sec ?? 0}s</span></p>
+              <p className="mt-2">Starvation watch: <span className="font-medium text-white">{decision.controller?.starvation_watch?.length ? decision.controller.starvation_watch.join(", ") : "none"}</span></p>
+            </div>
+          ) : null}
           <p className="mt-5 text-sm leading-7 text-slate-300">{layoutMode === "single" ? "This is the original one-camera workflow. Use it for one roadside feed, one upload, or one operator test camera." : "Real-world note: in production, connect one fixed CCTV or RTSP stream per direction. Browser camera mode is for testing when four roadside feeds are not yet wired in."}</p>
           {decisionError ? <p className="mt-5 rounded-2xl border border-rose-400/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{decisionError}</p> : null}
         </div>
