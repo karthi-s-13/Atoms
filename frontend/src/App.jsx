@@ -8,6 +8,7 @@ const SimulationPage = lazy(() => import("./pages/SimulationPage"));
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
 const ImpactPage = lazy(() => import("./pages/ImpactPage"));
 const LiveCvPage = lazy(() => import("./pages/LiveCvPage"));
+const MapPage = lazy(() => import("./pages/MapPage"));
 
 export default function App() {
   const {
@@ -48,6 +49,7 @@ export default function App() {
           <Route path="/dashboard" element={<DashboardPage snapshot={dashboardSnapshot} history={history} />} />
           <Route path="/impact" element={<ImpactPage snapshot={dashboardSnapshot} />} />
           <Route path="/live-cv" element={<LiveCvPage />} />
+          <Route path="/map" element={<MapPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Suspense>
