@@ -1,8 +1,5 @@
 import { NavLink } from "react-router-dom";
-
-function formatPhase(state) {
-  return String(state || "ALL_RED").split("_").join(" ");
-}
+import { formatTrafficModeLabel, matchTrafficModeId } from "../lib/trafficModes";
 
 const navItems = [
   { to: "/", label: "Home" },
@@ -13,22 +10,26 @@ const navItems = [
   { to: "/map", label: "Map" },
 ];
 
-export default function AppShell({ connectionState, snapshot, children }) {
+function formatSignalMode(value) {
+  return value === "adaptive" ? "Adaptive (AI-Based)" : "Fixed Timing";
+}
+
+export default function AppShell({ connectionState, controls, children }) {
+  const trafficModeLabel = formatTrafficModeLabel(matchTrafficModeId(controls));
+  const signalModeLabel = formatSignalMode(controls?.ai_mode);
+
   return (
     <div className="min-h-screen bg-hero-grid">
-      <header className="mx-auto flex w-full max-w-7xl flex-col gap-5 px-6 py-7 lg:flex-row lg:items-end lg:justify-between">
+      <header className="mx-auto flex w-full max-w-[1680px] flex-col gap-5 px-6 py-7 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <p className="text-xs uppercase tracking-[0.34em] text-cyan-300">Urban Mobility Digital Twin</p>
           <h1 className="mt-3 text-4xl font-semibold tracking-tight text-white">Realtime Traffic Intelligence Platform</h1>
-          <p className="mt-3 max-w-2xl text-sm leading-7 text-slate-300">
-            Deterministic one-direction control with one signal per approach, straight and right main-lane discipline,
-            left turns disabled, and a buffered 3D render loop tuned for stable operator use.
-          </p>
+          <p className="mt-3 max-w-2xl text-sm leading-7 text-slate-300">Operator-focused traffic simulation with live control, stable flow, and clear system feedback.</p>
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-2">
           <div className="rounded-3xl border border-white/10 bg-white/5 px-4 py-3 backdrop-blur-xl">
-            <p className="metric-label">Connection</p>
+            <p className="metric-label">Connection Status</p>
             <div className="mt-2 flex items-center gap-2">
               <span
                 className={`h-2.5 w-2.5 rounded-full ${
@@ -43,17 +44,16 @@ export default function AppShell({ connectionState, snapshot, children }) {
             </div>
           </div>
           <div className="rounded-3xl border border-white/10 bg-white/5 px-4 py-3 backdrop-blur-xl">
-            <p className="metric-label">Frame</p>
-            <p className="mt-2 text-lg font-semibold text-white">{snapshot.frame}</p>
-          </div>
-          <div className="rounded-3xl border border-white/10 bg-white/5 px-4 py-3 backdrop-blur-xl">
-            <p className="metric-label">Current Green</p>
-            <p className="mt-2 text-lg font-semibold text-white">{formatPhase(snapshot.current_state)}</p>
+            <p className="metric-label">Current Mode</p>
+            <div className="mt-2 space-y-1 text-sm text-slate-200">
+              <p><span className="text-slate-400">Traffic:</span> {trafficModeLabel}</p>
+              <p><span className="text-slate-400">Signal:</span> {signalModeLabel}</p>
+            </div>
           </div>
         </div>
       </header>
 
-      <nav className="mx-auto flex w-full max-w-7xl flex-wrap gap-3 px-6">
+      <nav className="mx-auto flex w-full max-w-[1680px] flex-wrap gap-3 px-6">
         {navItems.map((item) => (
           <NavLink
             key={item.to}
@@ -71,7 +71,7 @@ export default function AppShell({ connectionState, snapshot, children }) {
         ))}
       </nav>
 
-      <main className="mx-auto w-full max-w-7xl px-6 py-6">{children}</main>
+      <main className="mx-auto w-full max-w-[1680px] px-6 py-6">{children}</main>
     </div>
   );
 }

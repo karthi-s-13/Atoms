@@ -1,4 +1,21 @@
 .env
+.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyc.*
+*.cache
+*.log
+*.tmp
+*.backup
+
+frontend/node_modules/
+frontend/dist/
+
+models/ambulance_yolo_cls_run/
+.yolo-config/
+
+inspect_output.txt
+
+Thumbs.db
+.DS_Store
 

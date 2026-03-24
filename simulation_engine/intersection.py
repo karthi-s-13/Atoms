@@ -49,8 +49,8 @@ class Intersection:
     def config(self):
         return self.engine.config
 
-    def reset(self) -> None:
-        self.engine.reset()
+    def reset(self, config: Dict[str, object] | None = None) -> None:
+        self.engine.reset(config)
         self.last_network_context = {}
         self.congestion_level = 0.0
         self.outgoing_flow_rate = 0.0

@@ -23,10 +23,11 @@ export default function App() {
     play,
     pause,
     reset,
+    restartWithConfig,
   } = useRealtimeSimulation();
 
   return (
-    <AppShell connectionState={connectionState} snapshot={dashboardSnapshot}>
+    <AppShell connectionState={connectionState} controls={controls}>
       <Suspense fallback={<div className="glass-panel rounded-[2rem] p-8 text-sm text-slate-300">Loading command surface...</div>}>
         <Routes>
           <Route path="/" element={<HomePage snapshot={dashboardSnapshot} connectionState={connectionState} />} />
@@ -43,6 +44,7 @@ export default function App() {
                 play={play}
                 pause={pause}
                 reset={reset}
+                restartWithConfig={restartWithConfig}
               />
             }
           />

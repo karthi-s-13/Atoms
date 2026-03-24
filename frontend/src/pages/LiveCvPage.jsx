@@ -148,6 +148,29 @@ export default function LiveCvPage() {
   }, []);
 
   useEffect(() => {
+    if (layoutMode === "single") {
+      DIRECTIONS.slice(1).forEach(({ key }) => {
+        releaseCamera(key);
+        clearCanvas(overlayRefs.current[key]);
+      });
+      setApproaches((previous) => {
+        const next = { ...previous };
+        DIRECTIONS.slice(1).forEach(({ key }) => {
+          if (previous[key].sourceMode === "camera") {
+            next[key] = {
+              ...previous[key],
+              cameraState: "idle",
+              error: "",
+            };
+          }
+        });
+        return next;
+      });
+    }
+    void refreshDecision(approachesRef.current);
+  }, [layoutMode]);
+
+  useEffect(() => {
     DIRECTIONS.forEach(({ key }) => {
       const approach = approaches[key];
       if (approach.sourceMode === "camera") {
@@ -186,8 +209,9 @@ export default function LiveCvPage() {
   };
 
   const refreshDecision = async (nextApproaches) => {
+    const relevantDirections = layoutMode === "single" ? [DIRECTIONS[0]] : DIRECTIONS;
     const payload = {
-      approaches: DIRECTIONS.reduce((acc, { key }) => {
+      approaches: relevantDirections.reduce((acc, { key }) => {
         const stats = nextApproaches[key].stats;
         acc[key] = {
           vehicle_count: stats.count,
@@ -400,8 +424,8 @@ export default function LiveCvPage() {
       <section className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
         <div className="glass-panel rounded-[2rem] p-8">
           <p className="text-sm uppercase tracking-[0.3em] text-cyan-300">{layoutMode === "single" ? "Single Camera Live CV" : "4-Way Junction Live CV"}</p>
-          <h2 className="mt-4 text-4xl font-semibold tracking-tight text-white">{layoutMode === "single" ? "Single camera traffic analysis for one live feed or one uploaded CCTV source." : "North, South, East, and West traffic feeds with one recommended green phase."}</h2>
-          <p className="mt-5 max-w-3xl text-base leading-8 text-slate-300">{layoutMode === "single" ? "Use one camera or uploaded image/video when you want the original one-feed workflow. Switch to 4-way mode when you want per-direction signal planning for a real junction." : "Each direction can run from a live browser camera or uploaded CCTV image/video. The model scores traffic demand per approach, then the junction controller recommends one green signal and keeps the remaining approaches red."}</p>
+          <h2 className="mt-4 text-4xl font-semibold tracking-tight text-white">{layoutMode === "single" ? "Single camera traffic analysis for one live feed or one uploaded CCTV source." : "North, South, East, and West traffic feeds with one recommended green approach."}</h2>
+          <p className="mt-5 max-w-3xl text-base leading-8 text-slate-300">{layoutMode === "single" ? "Use one camera or uploaded image/video when you want the original one-feed workflow. Switch to 4-way mode when you want per-direction signal planning for a real junction." : "Each direction can run from a live browser camera or uploaded CCTV image/video. The model scores traffic demand per approach, then the junction controller recommends one green approach while the other three stay red."}</p>
           <div className="mt-8 flex flex-wrap gap-3">
             <button type="button" onClick={() => setLayoutMode("single")} className={`rounded-full px-5 py-2.5 text-sm font-semibold transition ${layoutMode === "single" ? "bg-cyan-400 text-slate-950" : "border border-white/10 bg-white/5 text-white hover:bg-white/10"}`}>Single Camera</button>
             <button type="button" onClick={() => setLayoutMode("junction")} className={`rounded-full px-5 py-2.5 text-sm font-semibold transition ${layoutMode === "junction" ? "bg-cyan-400 text-slate-950" : "border border-white/10 bg-white/5 text-white hover:bg-white/10"}`}>4-Way Junction</button>

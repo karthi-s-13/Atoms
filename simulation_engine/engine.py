@@ -4,16 +4,17 @@ import math
 import random
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, Iterable, List, Protocol
+from typing import Any, Deque, Dict, Iterable, List, Protocol, cast
 
 from simulation_engine.traffic_brain import (
     TrafficBrain,
     VehicleTelemetryInput,
 )
 from shared.contracts import (
+    ActorState,
+    AiMode,
     Approach,
     ControllerPhase,
-    CrosswalkView,
     EmergencyPriorityView,
     EventView,
     LaneArcView,
@@ -88,9 +89,9 @@ ROAD_SURFACE_HALF_WIDTH = ROAD_HALF_WIDTH + SHOULDER
 INTERSECTION_SIZE = 14.0
 INTERSECTION_HALF_SIZE = INTERSECTION_SIZE / 2.0
 STOP_OFFSET = INTERSECTION_HALF_SIZE + 3.0
-CROSSWALK_INNER_OFFSET = INTERSECTION_HALF_SIZE + 0.4
-CROSSWALK_OUTER_OFFSET = STOP_OFFSET - 0.9
-CROSSWALK_CENTER_OFFSET = (CROSSWALK_INNER_OFFSET + CROSSWALK_OUTER_OFFSET) / 2.0
+STOP_MARKER_INNER_OFFSET = INTERSECTION_HALF_SIZE + 0.4
+STOP_MARKER_OUTER_OFFSET = STOP_OFFSET - 0.9
+STOP_MARKER_CENTER_OFFSET = (STOP_MARKER_INNER_OFFSET + STOP_MARKER_OUTER_OFFSET) / 2.0
 PATH_ENTRY_OFFSET = ROAD_EXTENT
 PATH_EXIT_OFFSET = ROAD_EXTENT
 INTERSECTION_CLEAR_MARGIN = 1.2
@@ -115,9 +116,9 @@ OBJECT_AWARENESS_BUFFER = 0.8
 AWARENESS_REACTION_BUFFER = 1.2
 MIN_AWARENESS_SPEED = 1.0
 MIN_LEFT_TURN_RADIUS = 2.8
-LEFT_TURN_RADIUS = max(MIN_LEFT_TURN_RADIUS, CROSSWALK_OUTER_OFFSET - OUTER_LANE_OFFSET - 0.15)
+LEFT_TURN_RADIUS = max(MIN_LEFT_TURN_RADIUS, STOP_MARKER_OUTER_OFFSET - OUTER_LANE_OFFSET - 0.15)
 MIN_RIGHT_TURN_RADIUS = 4.2
-RIGHT_TURN_RADIUS = max(MIN_RIGHT_TURN_RADIUS, CROSSWALK_OUTER_OFFSET - INNER_LANE_OFFSET - 0.45)
+RIGHT_TURN_RADIUS = max(MIN_RIGHT_TURN_RADIUS, STOP_MARKER_OUTER_OFFSET - INNER_LANE_OFFSET - 0.45)
 SUB_PATH_OFFSET = min(0.5, LANE_WIDTH / 7.0)
 SUB_PATH_SAMPLE_STEP = 10.0
 DEADLOCK_UNBLOCK_TIME = 4.5
@@ -150,6 +151,24 @@ VEHICLE_APPROACHES: tuple[Approach, ...] = ("NORTH", "EAST", "SOUTH", "WEST")
 EMERGENCY_KIND_POOL: tuple[VehicleKind, ...] = ("ambulance", "firetruck", "police")
 LANE_SLOT_INDEX: dict[str, int] = {"outer": 0, "inner": 1}
 INCOMING_LANE_TYPE: LaneType = "INCOMING"
+OPPOSITE_APPROACH_MAP: dict[Approach, Approach] = {
+    "NORTH": "SOUTH",
+    "SOUTH": "NORTH",
+    "EAST": "WEST",
+    "WEST": "EAST",
+}
+LEFT_TURN_EXIT_MAP: dict[Approach, Approach] = {
+    "NORTH": "EAST",
+    "EAST": "SOUTH",
+    "SOUTH": "WEST",
+    "WEST": "NORTH",
+}
+RIGHT_TURN_EXIT_MAP: dict[Approach, Approach] = {
+    "NORTH": "WEST",
+    "EAST": "NORTH",
+    "SOUTH": "EAST",
+    "WEST": "SOUTH",
+}
 
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -158,6 +177,52 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
 
 def _lerp(a: float, b: float, t: float) -> float:
     return a + ((b - a) * t)
+
+
+def _coerce_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_int(value: object) -> int | None:
+    parsed = _coerce_float(value)
+    if parsed is None or not math.isfinite(parsed):
+        return None
+    return int(parsed)
+
+
+def _coerce_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return None
+
+
+def _coerce_ai_mode(value: object) -> AiMode | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"fixed", "adaptive", "emergency"}:
+        return cast(AiMode, normalized)
+    return None
 
 
 def _distance(a: Point2D, b: Point2D) -> float:
@@ -257,12 +322,10 @@ def _normalize_route_distribution(values: Dict[str, object] | None) -> Dict[str,
         return normalized
     for key, _, _ in ROUTE_SPAWN_ORDER:
         candidate = values.get(key)
-        if candidate is None:
+        parsed_candidate = _coerce_float(candidate)
+        if parsed_candidate is None:
             continue
-        try:
-            normalized[key] = float(max(0, round(float(candidate))))
-        except (TypeError, ValueError):
-            continue
+        normalized[key] = float(max(0, round(parsed_candidate)))
     return normalized
 
 
@@ -299,30 +362,15 @@ def _angle_span(start_angle: float, end_angle: float, *, clockwise: bool) -> flo
 
 
 def _opposite_approach(approach: Approach) -> Approach:
-    return {
-        "NORTH": "SOUTH",
-        "SOUTH": "NORTH",
-        "EAST": "WEST",
-        "WEST": "EAST",
-    }[approach]
+    return OPPOSITE_APPROACH_MAP[approach]
 
 
 def _left_turn_exit(approach: Approach) -> Approach:
-    return {
-        "NORTH": "EAST",
-        "EAST": "SOUTH",
-        "SOUTH": "WEST",
-        "WEST": "NORTH",
-    }[approach]
+    return LEFT_TURN_EXIT_MAP[approach]
 
 
 def _right_turn_exit(approach: Approach) -> Approach:
-    return {
-        "NORTH": "WEST",
-        "EAST": "NORTH",
-        "SOUTH": "EAST",
-        "WEST": "SOUTH",
-    }[approach]
+    return RIGHT_TURN_EXIT_MAP[approach]
 
 
 def _exit_direction_for_movement(approach: Approach, route: RouteType) -> Approach:
@@ -363,8 +411,13 @@ def _lane_center_anchor(direction: Point2D, lane_offset: float) -> Point2D:
 
 
 class LanePath(Protocol):
-    points: tuple[Point2D, ...]
-    length: float
+    @property
+    def points(self) -> tuple[Point2D, ...]:
+        ...
+
+    @property
+    def length(self) -> float:
+        ...
 
     def point_at_distance(self, distance_along: float) -> Point2D:
         ...
@@ -600,8 +653,8 @@ class LaneDefinition:
     path: LanePath
     stop_line_position: Point2D
     stop_distance: float
-    stop_crosswalk_id: str
-    crosswalk_start: Point2D
+    stop_zone_id: str
+    stop_reference_point: Point2D
     intersection_entry_distance: float
     intersection_exit_distance: float
     arc: LaneArcView | None = None
@@ -621,9 +674,9 @@ class LaneDefinition:
             start=self.path.points[0],
             end=self.path.points[-1],
             path=list(self.path.points),
-            crosswalk_id=self.stop_crosswalk_id,
+            stop_zone_id=self.stop_zone_id,
             stop_line_position=self.stop_line_position,
-            crosswalk_start=self.crosswalk_start,
+            stop_reference_point=self.stop_reference_point,
             left_sub_path=_sample_sub_path_points(self.path, "LEFT"),
             right_sub_path=_sample_sub_path_points(self.path, "RIGHT"),
             arc=self.arc,
@@ -642,7 +695,7 @@ class VehicleStateModel:
     sub_path_side: SubPathSide
     progress: float
     speed: float
-    state: str
+    state: ActorState
     position: Point2D
     heading: float
     velocity_x: float
@@ -831,19 +884,22 @@ class SignalController:
         phase_has_demand: Dict[SignalCycleState, bool],
         phase_demands: Dict[SignalCycleState, Dict[str, float]],
     ) -> SignalCycleState | None:
-        relief_candidates = [
+        relief_candidates: list[SignalCycleState] = [
             direction
             for direction in SIGNAL_ORDER
             if direction != current_direction and bool(phase_has_demand.get(direction, False))
         ]
         if not relief_candidates:
             return None
-        return max(
-            relief_candidates,
-            key=lambda direction: (
-                self.unserved_demand_time.get(direction, 0.0),
-                self._priority_score(direction, phase_demands),
-                -self._sequence_distance(current_direction, direction),
+        return cast(
+            SignalCycleState,
+            max(
+                relief_candidates,
+                key=lambda direction: (
+                    self.unserved_demand_time.get(direction, 0.0),
+                    self._priority_score(direction, phase_demands),
+                    -self._sequence_distance(current_direction, direction),
+                ),
             ),
         )
 
@@ -876,7 +932,7 @@ class SignalController:
         dt: float,
         *,
         intersection_clear: bool,
-        ai_mode: str,
+        ai_mode: AiMode,
         phase_scores: Dict[SignalCycleState, float],
         phase_has_demand: Dict[SignalCycleState, bool],
         phase_demands: Dict[SignalCycleState, Dict[str, float]],
@@ -985,34 +1041,40 @@ class SignalController:
                 return None
             return self._hold_current(current_duration)
 
-        demand_candidates = [
+        demand_candidates: list[SignalCycleState] = [
             direction
             for direction in SIGNAL_ORDER
             if direction != current_direction and bool(phase_has_demand.get(direction, False))
         ]
-        forced_candidates = [
+        forced_candidates: list[SignalCycleState] = [
             direction
             for direction in demand_candidates
             if self.unserved_demand_time.get(direction, 0.0) >= STARVATION_FORCE_SWITCH_TIME
         ]
         if forced_candidates:
-            forced_direction = min(
-                forced_candidates,
-                key=lambda direction: (
-                    -self.unserved_demand_time.get(direction, 0.0),
-                    self._sequence_distance(current_direction, direction),
-                    -self._priority_score(direction, phase_demands),
+            forced_direction = cast(
+                SignalCycleState,
+                min(
+                    forced_candidates,
+                    key=lambda direction: (
+                        -self.unserved_demand_time.get(direction, 0.0),
+                        self._sequence_distance(current_direction, direction),
+                        -self._priority_score(direction, phase_demands),
+                    ),
                 ),
             )
             return self._switch_to(forced_direction, self._adaptive_duration(forced_direction, phase_demands))
 
-        best_direction = (
-            max(
-                demand_candidates,
-                key=lambda direction: (
-                    self._priority_score(direction, phase_demands),
-                    self.unserved_demand_time.get(direction, 0.0),
-                    -self._sequence_distance(current_direction, direction),
+        best_direction: SignalCycleState | None = (
+            cast(
+                SignalCycleState,
+                max(
+                    demand_candidates,
+                    key=lambda direction: (
+                        self._priority_score(direction, phase_demands),
+                        self.unserved_demand_time.get(direction, 0.0),
+                        -self._sequence_distance(current_direction, direction),
+                    ),
                 ),
             )
             if demand_candidates
@@ -1045,7 +1107,6 @@ class TrafficSimulationEngine:
 
     def __init__(self) -> None:
         self.config = _default_config()
-        self.crosswalks = self._build_crosswalks()
         self.lanes: Dict[str, LaneDefinition] = {}
         self.phase_lane_ids: Dict[Approach, tuple[str, ...]] = {}
         self.lane_phase_map: Dict[str, Approach] = {}
@@ -1066,7 +1127,19 @@ class TrafficSimulationEngine:
         self.processed_vehicles = 0
         self.smoothed_throughput = 0.0
         self.vehicles: List[VehicleStateModel] = []
-        self.metrics = MetricsView(0.0, 0.0, 0, 0.0, 0, 0, 0, 0, 4, 0, 4.0)
+        self.metrics = MetricsView(
+            avg_wait_time=0.0,
+            throughput=0.0,
+            vehicles_processed=0,
+            queue_pressure=0.0,
+            active_vehicles=0,
+            queued_vehicles=0,
+            emergency_vehicles=0,
+            active_nodes=4,
+            detections=0,
+            bandwidth_savings=4.0,
+            vehicles_cleared_per_cycle=0,
+        )
         self._vehicle_index = 0
         self._vehicle_spawn_cursor = 0
         self._vehicle_spawn_timer = self._vehicle_spawn_interval()
@@ -1108,37 +1181,59 @@ class TrafficSimulationEngine:
     def update_config(self, values: Dict[str, object]) -> SimulationConfig:
         refresh_lanes = False
         if "traffic_intensity" in values:
-            self.config.traffic_intensity = _clamp(float(values["traffic_intensity"]), 0.0, 1.0)
-            self._vehicle_spawn_timer = min(self._vehicle_spawn_timer, self._vehicle_spawn_interval())
+            traffic_intensity = _coerce_float(values["traffic_intensity"])
+            if traffic_intensity is not None:
+                self.config.traffic_intensity = _clamp(traffic_intensity, 0.0, 1.0)
+                self._vehicle_spawn_timer = min(self._vehicle_spawn_timer, self._vehicle_spawn_interval())
         if "ambulance_frequency" in values:
-            self.config.ambulance_frequency = _clamp(float(values["ambulance_frequency"]), 0.0, 1.0)
+            ambulance_frequency = _coerce_float(values["ambulance_frequency"])
+            if ambulance_frequency is not None:
+                self.config.ambulance_frequency = _clamp(ambulance_frequency, 0.0, 1.0)
         if "ai_mode" in values:
-            requested_mode = str(values["ai_mode"]).strip().lower()
+            requested_mode = _coerce_ai_mode(values["ai_mode"])
             if requested_mode in {"fixed", "adaptive"}:
                 self.config.ai_mode = requested_mode
         if "speed_multiplier" in values:
-            self.config.speed_multiplier = _clamp(float(values["speed_multiplier"]), 0.25, 4.0)
+            speed_multiplier = _coerce_float(values["speed_multiplier"])
+            if speed_multiplier is not None:
+                self.config.speed_multiplier = _clamp(speed_multiplier, 0.25, 4.0)
         if "spawn_rate_multiplier" in values:
-            self.config.spawn_rate_multiplier = _clamp(
-                float(values["spawn_rate_multiplier"]),
-                MIN_SPAWN_RATE_MULTIPLIER,
-                MAX_SPAWN_RATE_MULTIPLIER,
-            )
-            self._vehicle_spawn_timer = min(self._vehicle_spawn_timer, self._vehicle_spawn_interval())
+            spawn_rate_multiplier = _coerce_float(values["spawn_rate_multiplier"])
+            if spawn_rate_multiplier is not None:
+                self.config.spawn_rate_multiplier = _clamp(
+                    spawn_rate_multiplier,
+                    MIN_SPAWN_RATE_MULTIPLIER,
+                    MAX_SPAWN_RATE_MULTIPLIER,
+                )
+                self._vehicle_spawn_timer = min(self._vehicle_spawn_timer, self._vehicle_spawn_interval())
         if "safe_gap_multiplier" in values:
-            self.config.safe_gap_multiplier = _clamp(float(values["safe_gap_multiplier"]), 0.55, 1.75)
+            safe_gap_multiplier = _coerce_float(values["safe_gap_multiplier"])
+            if safe_gap_multiplier is not None:
+                self.config.safe_gap_multiplier = _clamp(safe_gap_multiplier, 0.55, 1.75)
         if "turn_smoothness" in values:
-            next_turn_smoothness = _clamp(float(values["turn_smoothness"]), 0.0, 1.0)
-            refresh_lanes = refresh_lanes or abs(next_turn_smoothness - self.config.turn_smoothness) > 1e-6
-            self.config.turn_smoothness = next_turn_smoothness
+            turn_smoothness = _coerce_float(values["turn_smoothness"])
+            if turn_smoothness is not None:
+                next_turn_smoothness = _clamp(turn_smoothness, 0.0, 1.0)
+                refresh_lanes = refresh_lanes or abs(next_turn_smoothness - self.config.turn_smoothness) > 1e-6
+                self.config.turn_smoothness = next_turn_smoothness
         if "max_emergency_vehicles" in values:
-            self.config.max_emergency_vehicles = max(0, min(20, int(values["max_emergency_vehicles"])))
+            max_emergency_vehicles = _coerce_int(values["max_emergency_vehicles"])
+            if max_emergency_vehicles is not None:
+                self.config.max_emergency_vehicles = max(0, min(20, max_emergency_vehicles))
         if "paused" in values:
-            self.config.paused = bool(values["paused"])
+            paused = _coerce_bool(values["paused"])
+            if paused is not None:
+                self.config.paused = paused
         if "max_vehicles" in values:
-            self.config.max_vehicles = max(0, min(80, int(values["max_vehicles"])))
+            max_vehicles = _coerce_int(values["max_vehicles"])
+            if max_vehicles is not None:
+                self.config.max_vehicles = max(0, min(80, max_vehicles))
         if "route_distribution" in values:
-            self.config.route_distribution = _normalize_route_distribution(values["route_distribution"])
+            route_distribution = values["route_distribution"]
+            if isinstance(route_distribution, dict):
+                self.config.route_distribution = _normalize_route_distribution(
+                    cast(Dict[str, object], route_distribution)
+                )
         if refresh_lanes:
             self._refresh_lane_geometry()
         return self.config
@@ -1275,45 +1370,12 @@ class TrafficSimulationEngine:
             min_green_remaining=round(self.signal_controller.min_green_remaining(), 3),
             vehicles=[self._vehicle_view(vehicle) for vehicle in self.vehicles],
             lanes=[lane.to_view() for lane in self.lanes.values()],
-            crosswalks=list(self.crosswalks.values()),
             signals=self._signal_snapshot(),
             metrics=self.metrics,
             traffic_brain=self.traffic_brain_state,
             events=list(self.events),
             config=self.config,
         )
-
-    def _build_crosswalks(self) -> Dict[str, CrosswalkView]:
-        return {
-            "north_crosswalk": CrosswalkView(
-                id="north_crosswalk",
-                road_direction="NS",
-                start=Point2D(-ROAD_SURFACE_HALF_WIDTH, CROSSWALK_CENTER_OFFSET),
-                end=Point2D(ROAD_SURFACE_HALF_WIDTH, CROSSWALK_CENTER_OFFSET),
-                movement=Point2D(1.0, 0.0),
-            ),
-            "south_crosswalk": CrosswalkView(
-                id="south_crosswalk",
-                road_direction="NS",
-                start=Point2D(-ROAD_SURFACE_HALF_WIDTH, -CROSSWALK_CENTER_OFFSET),
-                end=Point2D(ROAD_SURFACE_HALF_WIDTH, -CROSSWALK_CENTER_OFFSET),
-                movement=Point2D(1.0, 0.0),
-            ),
-            "east_crosswalk": CrosswalkView(
-                id="east_crosswalk",
-                road_direction="EW",
-                start=Point2D(CROSSWALK_CENTER_OFFSET, -ROAD_SURFACE_HALF_WIDTH),
-                end=Point2D(CROSSWALK_CENTER_OFFSET, ROAD_SURFACE_HALF_WIDTH),
-                movement=Point2D(0.0, 1.0),
-            ),
-            "west_crosswalk": CrosswalkView(
-                id="west_crosswalk",
-                road_direction="EW",
-                start=Point2D(-CROSSWALK_CENTER_OFFSET, -ROAD_SURFACE_HALF_WIDTH),
-                end=Point2D(-CROSSWALK_CENTER_OFFSET, ROAD_SURFACE_HALF_WIDTH),
-                movement=Point2D(0.0, 1.0),
-            ),
-        }
 
     def _build_lanes(self) -> Dict[str, LaneDefinition]:
         lanes: Dict[str, LaneDefinition] = {}
@@ -1325,8 +1387,8 @@ class TrafficSimulationEngine:
             movement: LaneMovement,
             points: Iterable[Point2D],
             stop_line_position: Point2D,
-            crosswalk_id: str,
-            crosswalk_start: Point2D,
+            stop_zone_id: str,
+            stop_reference_point: Point2D,
             *,
             kind: LaneKind = "main",
             shared_lane_id: str | None = None,
@@ -1344,8 +1406,8 @@ class TrafficSimulationEngine:
                 path=path,
                 stop_line_position=stop_line_position,
                 stop_distance=_distance(path.points[0], stop_line_position),
-                stop_crosswalk_id=crosswalk_id,
-                crosswalk_start=crosswalk_start,
+                stop_zone_id=stop_zone_id,
+                stop_reference_point=stop_reference_point,
                 intersection_entry_distance=intersection_entry_distance,
                 intersection_exit_distance=intersection_exit_distance,
             )
@@ -1360,8 +1422,8 @@ class TrafficSimulationEngine:
                 Point2D(INNER_LANE_OFFSET, -PATH_EXIT_OFFSET),
             ),
             Point2D(INNER_LANE_OFFSET, STOP_OFFSET),
-            "north_crosswalk",
-            Point2D(INNER_LANE_OFFSET, CROSSWALK_OUTER_OFFSET),
+            "north_stop_zone",
+            Point2D(INNER_LANE_OFFSET, STOP_MARKER_OUTER_OFFSET),
             shared_lane_id="north_inner",
         )
         add_lane(
@@ -1374,8 +1436,8 @@ class TrafficSimulationEngine:
                 Point2D(-INNER_LANE_OFFSET, PATH_EXIT_OFFSET),
             ),
             Point2D(-INNER_LANE_OFFSET, -STOP_OFFSET),
-            "south_crosswalk",
-            Point2D(-INNER_LANE_OFFSET, -CROSSWALK_OUTER_OFFSET),
+            "south_stop_zone",
+            Point2D(-INNER_LANE_OFFSET, -STOP_MARKER_OUTER_OFFSET),
             shared_lane_id="south_inner",
         )
         add_lane(
@@ -1388,8 +1450,8 @@ class TrafficSimulationEngine:
                 Point2D(-PATH_EXIT_OFFSET, -INNER_LANE_OFFSET),
             ),
             Point2D(STOP_OFFSET, -INNER_LANE_OFFSET),
-            "east_crosswalk",
-            Point2D(CROSSWALK_OUTER_OFFSET, -INNER_LANE_OFFSET),
+            "east_stop_zone",
+            Point2D(STOP_MARKER_OUTER_OFFSET, -INNER_LANE_OFFSET),
             shared_lane_id="east_inner",
         )
         add_lane(
@@ -1402,8 +1464,8 @@ class TrafficSimulationEngine:
                 Point2D(PATH_EXIT_OFFSET, INNER_LANE_OFFSET),
             ),
             Point2D(-STOP_OFFSET, INNER_LANE_OFFSET),
-            "west_crosswalk",
-            Point2D(-CROSSWALK_OUTER_OFFSET, INNER_LANE_OFFSET),
+            "west_stop_zone",
+            Point2D(-STOP_MARKER_OUTER_OFFSET, INNER_LANE_OFFSET),
             shared_lane_id="west_inner",
         )
 
@@ -1418,8 +1480,8 @@ class TrafficSimulationEngine:
             arc_center: Point2D,
             turn_exit: Point2D,
             exit_end: Point2D,
-            crosswalk_id: str,
-            crosswalk_start: Point2D,
+            stop_zone_id: str,
+            stop_reference_point: Point2D,
             *,
             kind: LaneKind = "main",
             arc_clockwise: bool = True,
@@ -1450,8 +1512,8 @@ class TrafficSimulationEngine:
                 path=path,
                 stop_line_position=stop_line_position,
                 stop_distance=_distance(path.points[0], stop_line_position),
-                stop_crosswalk_id=crosswalk_id,
-                crosswalk_start=crosswalk_start,
+                stop_zone_id=stop_zone_id,
+                stop_reference_point=stop_reference_point,
                 intersection_entry_distance=intersection_entry_distance,
                 intersection_exit_distance=intersection_exit_distance,
                 arc=arc.to_view(),
@@ -1485,7 +1547,7 @@ class TrafficSimulationEngine:
             turn_exit = _offset_point(turn_center, curve_normal(outgoing_direction), -turn_radius)
             entry_start = _offset_point(incoming_anchor, incoming_direction, -PATH_ENTRY_OFFSET)
             stop_line_position = _offset_point(incoming_anchor, incoming_direction, -STOP_OFFSET)
-            crosswalk_start = _offset_point(incoming_anchor, incoming_direction, -CROSSWALK_OUTER_OFFSET)
+            stop_reference_point = _offset_point(incoming_anchor, incoming_direction, -STOP_MARKER_OUTER_OFFSET)
             exit_end = _offset_point(outgoing_anchor, outgoing_direction, PATH_EXIT_OFFSET)
 
             add_arc_lane(
@@ -1499,8 +1561,8 @@ class TrafficSimulationEngine:
                 turn_center,
                 turn_exit,
                 exit_end,
-                f"{approach.lower()}_crosswalk",
-                crosswalk_start,
+                f"{approach.lower()}_stop_zone",
+                stop_reference_point,
                 arc_clockwise=arc_clockwise,
                 shared_lane_id=shared_lane_id,
             )

@@ -1,15 +1,46 @@
 export type SignalState = "GREEN" | "GREEN_LEFT" | "YELLOW" | "RED";
 export type ControllerPhase = "PHASE_GREEN" | "PHASE_YELLOW" | "PHASE_ALL_RED";
-export type SignalCycleState = "NORTH" | "EAST" | "SOUTH" | "WEST";
-export type Approach = "NORTH" | "SOUTH" | "EAST" | "WEST";
-export type RoadDirection = "NS" | "EW";
+export type GlobalDirection = "NORTH" | "SOUTH" | "EAST" | "WEST";
+export type SignalCycleState = GlobalDirection;
+export type Approach = GlobalDirection;
+export type LaneType = "INCOMING" | "OUTGOING";
 export type ActorState = "MOVING" | "STOPPED";
-export type PedestrianState = "WAITING" | "CROSSING" | "EXITING";
 export type VehicleKind = "car" | "ambulance" | "firetruck" | "police";
-export type AiMode = "fixed" | "adaptive" | "emergency" | "pedestrian";
-export type RouteType = "straight" | "right" | "left";
-export type LaneKind = "main" | "slip";
-export type LaneMovement = "STRAIGHT" | "RIGHT" | "LEFT";
+export type AiMode = "fixed" | "adaptive" | "emergency";
+export type RouteType = "straight" | "left" | "right";
+export type VehicleIntent = "LEFT" | "STRAIGHT" | "RIGHT";
+export type SubPathSide = "LEFT" | "RIGHT";
+export type LaneKind = "main";
+export type LaneMovement = "STRAIGHT" | "LEFT" | "RIGHT";
+
+export interface DirectionAxisView {
+  x: number;
+  z: number;
+}
+
+export const GLOBAL_DIRECTIONS: readonly GlobalDirection[] = ["NORTH", "EAST", "SOUTH", "WEST"];
+export const LANE_TYPES: readonly LaneType[] = ["INCOMING", "OUTGOING"];
+export const WORLD_DIRECTION_AXES: Readonly<Record<GlobalDirection, DirectionAxisView>> = {
+  NORTH: { x: 0, z: -1 },
+  SOUTH: { x: 0, z: 1 },
+  EAST: { x: 1, z: 0 },
+  WEST: { x: -1, z: 0 },
+};
+
+export const DEFAULT_ROUTE_DISTRIBUTION: Readonly<Record<string, number>> = {
+  "NORTH->SOUTH": 5,
+  "NORTH->EAST": 2,
+  "NORTH->WEST": 2,
+  "EAST->WEST": 5,
+  "EAST->SOUTH": 2,
+  "EAST->NORTH": 2,
+  "SOUTH->NORTH": 5,
+  "SOUTH->WEST": 2,
+  "SOUTH->EAST": 2,
+  "WEST->EAST": 5,
+  "WEST->NORTH": 2,
+  "WEST->SOUTH": 2,
+};
 
 export interface Point2D {
   x: number;
@@ -30,32 +61,33 @@ export interface LaneView {
   id: string;
   kind: LaneKind;
   approach: Approach;
-  direction: Approach;
+  direction: GlobalDirection;
+  lane_type: LaneType;
+  lane_index: number;
+  lane_slot: string;
   movement: LaneMovement;
   start: Point2D;
   end: Point2D;
   path: Point2D[];
-  crosswalk_id: string;
+  stop_zone_id: string;
   stop_line_position: Point2D;
-  crosswalk_start: Point2D;
+  stop_reference_point: Point2D;
+  left_sub_path: Point2D[];
+  right_sub_path: Point2D[];
   arc?: LaneArcView | null;
   turn_entry?: Point2D | null;
   turn_exit?: Point2D | null;
 }
 
-export interface CrosswalkView {
-  id: string;
-  road_direction: RoadDirection;
-  start: Point2D;
-  end: Point2D;
-  movement: Point2D;
-}
-
 export interface VehicleView {
   id: string;
   lane_id: string;
+  current_lane_id: string;
   approach: Approach;
+  origin_direction: GlobalDirection;
   route: RouteType;
+  intent: VehicleIntent;
+  sub_path_side: SubPathSide;
   progress: number;
   speed: number;
   velocity_x: number;
@@ -73,41 +105,18 @@ export interface VehicleView {
   width: number;
 }
 
-export interface PedestrianView {
-  id: string;
-  crossing: RoadDirection;
-  target_crosswalk: string;
-  crosswalk_id: string;
-  road_direction: RoadDirection;
-  progress: number;
-  speed: number;
-  velocity_x: number;
-  velocity_y: number;
-  x: number;
-  y: number;
-  state: PedestrianState;
-  wait_time: number;
-  is_elderly: boolean;
-  is_impatient: boolean;
-  risky_crossing: boolean;
-  look_angle: number;
-  shirt_color: string;
-  pants_color: string;
-  body_scale: number;
-}
-
 export interface MetricsView {
   avg_wait_time: number;
   throughput: number;
   vehicles_processed: number;
   queue_pressure: number;
   active_vehicles: number;
-  active_pedestrians: number;
   queued_vehicles: number;
   emergency_vehicles: number;
   active_nodes: number;
   detections: number;
   bandwidth_savings: number;
+  vehicles_cleared_per_cycle: number;
 }
 
 export interface DirectionMetricView {
@@ -119,6 +128,7 @@ export interface DirectionMetricView {
   congestion_trend: number;
   emergency_vehicles: number;
   alert_level: string;
+  arrival_rate: number;
 }
 
 export interface PhaseScoreView {
@@ -128,18 +138,19 @@ export interface PhaseScoreView {
   wait_time_component: number;
   congestion_component: number;
   flow_component: number;
+  lane_weight_component: number;
   fairness_boost: number;
   emergency_boost: number;
   queue_length: number;
   avg_wait_time: number;
   flow_rate: number;
-  pedestrian_demand: number;
   demand_active: boolean;
   recommended_hold: boolean;
   decision_reason: string;
   neighbor_arrival_boost: number;
   green_wave_boost: number;
   downstream_congestion_penalty: number;
+  arrival_rate: number;
 }
 
 export interface CongestionAlertView {
@@ -156,6 +167,8 @@ export interface EmergencyPriorityView {
   approach: Approach | null;
   vehicle_id: string;
   eta_seconds: number;
+  vehicle_count: number;
+  priority_score: number;
   state: string;
 }
 
@@ -218,9 +231,14 @@ export interface SimulationConfig {
   ambulance_frequency: number;
   ai_mode: AiMode;
   speed_multiplier: number;
+  spawn_rate_multiplier: number;
+  safe_gap_multiplier: number;
+  turn_smoothness: number;
+  max_emergency_vehicles: number;
   paused: boolean;
   max_vehicles: number;
-  max_pedestrians: number;
+
+  route_distribution: Record<string, number>;
 }
 
 export interface SnapshotView {
@@ -228,17 +246,15 @@ export interface SnapshotView {
   timestamp: number;
   current_state: SignalCycleState;
   active_direction: Approach | null;
+  direction_axes: Record<GlobalDirection, DirectionAxisView>;
   intersection_id: string;
   controller_phase: ControllerPhase;
   phase_timer: number;
   phase_duration: number;
   min_green_remaining: number;
   vehicles: VehicleView[];
-  pedestrians: PedestrianView[];
   lanes: LaneView[];
-  crosswalks: CrosswalkView[];
   signals: Record<string, SignalState>;
-  pedestrian_phase_active: boolean;
   metrics: MetricsView;
   traffic_brain: TrafficBrainView;
   network: TrafficNetworkView | null;

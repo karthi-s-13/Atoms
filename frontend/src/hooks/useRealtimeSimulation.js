@@ -6,12 +6,16 @@ const PHASES = ["NORTH", "EAST", "SOUTH", "WEST"];
 export const DEFAULT_ROUTE_DISTRIBUTION = {
   "NORTH->SOUTH": 5,
   "NORTH->EAST": 2,
+  "NORTH->WEST": 2,
   "EAST->WEST": 5,
   "EAST->SOUTH": 2,
+  "EAST->NORTH": 2,
   "SOUTH->NORTH": 5,
   "SOUTH->WEST": 2,
+  "SOUTH->EAST": 2,
   "WEST->EAST": 5,
   "WEST->NORTH": 2,
+  "WEST->SOUTH": 2,
 };
 
 export const DEFAULT_CONFIG = {
@@ -123,7 +127,6 @@ const DEFAULT_SNAPSHOT = {
   min_green_remaining: 7,
   vehicles: [],
   lanes: [],
-  crosswalks: [],
   signals: {
     NORTH: "GREEN",
     SOUTH: "RED",
@@ -158,7 +161,6 @@ function normalizeSnapshot(snapshot) {
     ...snapshot,
     vehicles: Array.isArray(snapshot.vehicles) ? snapshot.vehicles : [],
     lanes: Array.isArray(snapshot.lanes) ? snapshot.lanes : [],
-    crosswalks: Array.isArray(snapshot.crosswalks) ? snapshot.crosswalks : [],
     events: Array.isArray(snapshot.events) ? snapshot.events : [],
     signals: { ...DEFAULT_SNAPSHOT.signals, ...(snapshot.signals ?? {}) },
     direction_axes: { ...WORLD_DIRECTION_AXES, ...(snapshot.direction_axes ?? {}) },

@@ -98,7 +98,7 @@ class TrafficSimulationEngineTest(unittest.TestCase):
         self.assertEqual(snapshot["controller_phase"], PHASE_GREEN)
         self.assertEqual(snapshot["signals"], {"NORTH": "GREEN", "EAST": "RED", "SOUTH": "RED", "WEST": "RED"})
         self.assertEqual(snapshot["vehicles"], [])
-        self.assertEqual(len(snapshot["crosswalks"]), 4)
+        self.assertEqual(len(snapshot["lanes"]), len(self.engine.lanes))
 
     def test_lane_geometry_uses_left_side_driving_consistently(self) -> None:
         north_straight = self.engine.lanes["lane_north_straight"]
@@ -115,10 +115,10 @@ class TrafficSimulationEngineTest(unittest.TestCase):
         self.assertGreater(east_straight.path.points[0].y, east_left.path.points[0].y)
         self.assertLess(west_straight.path.points[0].y, west_left.path.points[0].y)
 
-        self.assertEqual(north_straight.stop_crosswalk_id, "north_crosswalk")
-        self.assertEqual(south_straight.stop_crosswalk_id, "south_crosswalk")
-        self.assertEqual(east_straight.stop_crosswalk_id, "east_crosswalk")
-        self.assertEqual(west_straight.stop_crosswalk_id, "west_crosswalk")
+        self.assertEqual(north_straight.stop_zone_id, "north_stop_zone")
+        self.assertEqual(south_straight.stop_zone_id, "south_stop_zone")
+        self.assertEqual(east_straight.stop_zone_id, "east_stop_zone")
+        self.assertEqual(west_straight.stop_zone_id, "west_stop_zone")
         self.assertTrue(all(lane.kind == "main" for lane in self.engine.lanes.values()))
 
     def test_no_slip_lanes_exist_and_right_turns_share_the_inner_approach_lane(self) -> None:
@@ -204,12 +204,12 @@ class TrafficSimulationEngineTest(unittest.TestCase):
         self.engine.update_vehicles(1.2)
 
         blocked_lane = self.engine.lanes[blocked.lane_id]
-        crosswalk_distance = math.hypot(
-            blocked_lane.crosswalk_start.x - blocked_lane.path.points[0].x,
-            blocked_lane.crosswalk_start.y - blocked_lane.path.points[0].y,
+        stop_reference_distance = math.hypot(
+            blocked_lane.stop_reference_point.x - blocked_lane.path.points[0].x,
+            blocked_lane.stop_reference_point.y - blocked_lane.path.points[0].y,
         )
         self.assertLessEqual(blocked.distance_along, blocked_lane.stop_distance)
-        self.assertLess(blocked.distance_along + (blocked.length / 2.0), crosswalk_distance)
+        self.assertLess(blocked.distance_along + (blocked.length / 2.0), stop_reference_distance)
         self.assertGreater(allowed.distance_along, self.engine.lanes[allowed.lane_id].stop_distance - 1.0)
 
     def test_left_turn_lane_arcs_are_symmetric_and_inside_intersection(self) -> None:
@@ -222,11 +222,11 @@ class TrafficSimulationEngineTest(unittest.TestCase):
             self.assertAlmostEqual(lane.arc.radius, LEFT_TURN_RADIUS, places=6)
             self.assertGreaterEqual(abs(lane.arc.center.x), INTERSECTION_HALF_SIZE)
             self.assertGreaterEqual(abs(lane.arc.center.y), INTERSECTION_HALF_SIZE)
-            crosswalk_distance = math.hypot(
-                lane.crosswalk_start.x - lane.path.points[0].x,
-                lane.crosswalk_start.y - lane.path.points[0].y,
+            stop_reference_distance = math.hypot(
+                lane.stop_reference_point.x - lane.path.points[0].x,
+                lane.stop_reference_point.y - lane.path.points[0].y,
             )
-            self.assertGreater(lane.path.entry_length, crosswalk_distance)
+            self.assertGreater(lane.path.entry_length, stop_reference_distance)
 
             for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
                 point = lane.path.point_at_distance(lane.path.entry_length + (lane.path.arc.length * fraction))
@@ -290,12 +290,12 @@ class TrafficSimulationEngineTest(unittest.TestCase):
         self.engine.update_vehicles(1.0)
 
         blocked_lane = self.engine.lanes[blocked.lane_id]
-        crosswalk_distance = math.hypot(
-            blocked_lane.crosswalk_start.x - blocked_lane.path.points[0].x,
-            blocked_lane.crosswalk_start.y - blocked_lane.path.points[0].y,
+        stop_reference_distance = math.hypot(
+            blocked_lane.stop_reference_point.x - blocked_lane.path.points[0].x,
+            blocked_lane.stop_reference_point.y - blocked_lane.path.points[0].y,
         )
         self.assertLessEqual(blocked.distance_along, blocked_lane.stop_distance)
-        self.assertLess(blocked.distance_along + (blocked.length / 2.0), crosswalk_distance)
+        self.assertLess(blocked.distance_along + (blocked.length / 2.0), stop_reference_distance)
         self.assertGreater(allowed.distance_along, blocked.distance_along)
 
     def test_same_path_queue_maintains_safe_gap(self) -> None:

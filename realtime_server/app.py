@@ -36,6 +36,7 @@ from simulation_engine import FRAME_DT, TrafficNetwork
 
 JUNCTION_REGISTRY_PATH = Path(__file__).resolve().parent / "junction_registry.json"
 AMBULANCE_CLASSIFIER_PATH = PROJECT_ROOT / "models" / "ambulance_yolo_cls.pt"
+BASE_DETECTOR_MODEL_PATH = PROJECT_ROOT / "yolov8n.pt"
 VEHICLE_CLASS_IDS = {1, 2, 3, 5, 7}
 VEHICLE_LABELS = {
     1: "bicycle",
@@ -533,7 +534,8 @@ class VehicleDetector:
 
         async with self._lock:
             if self._model is None:
-                self._model = await asyncio.to_thread(YOLO, "yolov8n.pt")
+                model_source = str(BASE_DETECTOR_MODEL_PATH if BASE_DETECTOR_MODEL_PATH.exists() else "yolov8n.pt")
+                self._model = await asyncio.to_thread(YOLO, model_source)
         return self._model
 
     async def _get_tracking_model(self, stream_key: str) -> YOLO:
@@ -1847,7 +1849,8 @@ class SimulationRuntime:
             elif message_type == "play":
                 self.engine.update_config({"paused": False})
             elif message_type == "reset":
-                self.engine.reset()
+                config = message.get("config")
+                self.engine.reset(config if isinstance(config, dict) else None)
             elif message_type == "ping":
                 return {"type": "pong", "sent_at": round(time.time(), 6)}
             else:

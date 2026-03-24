@@ -1,10 +1,12 @@
 export default function DonutChart({ title, items }) {
-  const total = items.reduce((sum, item) => sum + item.value, 0) || 1;
+  const totalValue = items.reduce((sum, item) => sum + item.value, 0);
+  const safeTotal = totalValue || 1;
   let offset = 0;
   const segments = items
+    .filter((item) => item.value > 0)
     .map((item) => {
       const start = offset;
-      const span = (item.value / total) * 360;
+      const span = (item.value / safeTotal) * 360;
       offset += span;
       return `${item.color} ${start}deg ${offset}deg`;
     })
@@ -21,7 +23,7 @@ export default function DonutChart({ title, items }) {
           }}
         >
           <div className="m-6 flex h-24 w-24 items-center justify-center rounded-full bg-slate-950/90 text-xl font-semibold text-white">
-            {total}
+            {totalValue}
           </div>
         </div>
         <div className="flex-1 space-y-3">

@@ -102,18 +102,16 @@ def render(snapshot: Dict[str, object]) -> None:
         st.warning(f"Simulation recovered from an error and is rendering the last valid snapshot: {error_message}")
 
     metrics = snapshot["metrics"]
-    top = st.columns(5)
+    top = st.columns(4)
     top[0].metric("Frame", snapshot["frame"])
     top[1].metric("Active Flow", snapshot["active_direction"] or "ALL RED")
     top[2].metric("Vehicles", metrics["active_vehicles"])
-    top[3].metric("Pedestrians", metrics["active_pedestrians"])
-    top[4].metric("Avg Wait", f"{metrics['avg_wait_time']:.2f}s")
+    top[3].metric("Avg Wait", f"{metrics['avg_wait_time']:.2f}s")
 
     chart_col, detail_col = st.columns([1.7, 1.0])
     with chart_col:
         fig = go.Figure()
         fig.add_trace(_positions(snapshot["vehicles"], "#38bdf8", "Vehicles"))
-        fig.add_trace(_positions(snapshot["pedestrians"], "#f97316", "Pedestrians"))
         fig.update_layout(
             height=520,
             margin={"l": 20, "r": 20, "t": 20, "b": 20},
@@ -133,13 +131,8 @@ def render(snapshot: Dict[str, object]) -> None:
         st.dataframe(snapshot["events"][:8], use_container_width=True, hide_index=True)
 
     st.subheader("Live Actors")
-    actor_col, ped_col = st.columns(2)
-    with actor_col:
-        st.caption("Vehicles")
-        st.dataframe(snapshot["vehicles"][:12], use_container_width=True, hide_index=True)
-    with ped_col:
-        st.caption("Pedestrians")
-        st.dataframe(snapshot["pedestrians"][:12], use_container_width=True, hide_index=True)
+    st.caption("Vehicles")
+    st.dataframe(snapshot["vehicles"][:12], use_container_width=True, hide_index=True)
 
 
 def run_frame(engine: TrafficSimulationEngine) -> None:

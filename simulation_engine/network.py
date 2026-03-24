@@ -24,8 +24,8 @@ class TrafficNetwork:
     def update_config(self, values: Dict[str, object]):
         return self.engine.update_config(values)
 
-    def reset(self) -> None:
-        self.engine.reset()
+    def reset(self, config: Dict[str, object] | None = None) -> None:
+        self.engine.reset(config)
 
     def tick(self, dt: float = FRAME_DT) -> Dict[str, object]:
         return self.engine.tick(dt)
