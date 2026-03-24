@@ -15,7 +15,7 @@ export default function ImpactPage({ snapshot }) {
         <h2 className="mt-4 text-4xl font-semibold tracking-tight text-white">Scale the digital twin across multiple cities.</h2>
         <p className="mt-4 max-w-2xl text-base leading-8 text-slate-300">
           Use the slider to model a multi-city rollout. The estimates blend live simulation outcomes with deployment multipliers to
-          show how emergency preemption, pedestrian protection, and adaptive phasing compound at scale.
+          show how emergency preemption, queue reduction, and adaptive phasing compound at scale.
         </p>
         <div className="mt-6 rounded-3xl border border-white/10 bg-white/[0.04] p-5">
           <div className="flex items-center justify-between text-sm text-slate-300">
@@ -37,7 +37,7 @@ export default function ImpactPage({ snapshot }) {
         <div className="glass-panel rounded-[2rem] p-6">
           <p className="panel-title">Why It Matters</p>
           <div className="mt-4 space-y-4 text-sm leading-7 text-slate-300">
-            <p>Synchronized crossing windows cut risky vehicle-crosswalk overlap.</p>
+            <p>Adaptive timing cuts risky stop-and-go waves before queues spill back through the junction.</p>
             <p>Emergency preemption reduces response delay where every second matters.</p>
             <p>Buffered realtime telemetry lowers operator fatigue by keeping motion smooth and readable.</p>
           </div>

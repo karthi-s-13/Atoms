@@ -1,7 +1,15 @@
-import { Line, OrbitControls } from "@react-three/drei";
+import { Billboard, Line, OrbitControls, Text } from "@react-three/drei";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
+import {
+  directionAxis,
+  isVerticalDirection,
+  simulationToWorldVector,
+  worldPointForDirection,
+  worldYawFromSimulationHeading,
+  worldYawFromSimulationVector,
+} from "../lib/directions";
 
 const LANE_WIDTH = 3.5;
 const LANES_PER_DIRECTION = 2;
@@ -16,23 +24,23 @@ const ROAD_SURFACE_LENGTH = (ROAD_EXTENT * 2) + 12;
 const ROAD_SURFACE_HALF_LENGTH = ROAD_SURFACE_LENGTH / 2;
 const INTERSECTION_SIZE = 14;
 const INTERSECTION_HALF_SIZE = INTERSECTION_SIZE / 2;
-const CROSSWALK_INNER_OFFSET = INTERSECTION_HALF_SIZE + 0.4;
-const STOP_OFFSET = INTERSECTION_HALF_SIZE + 3;
-const CROSSWALK_OUTER_OFFSET = STOP_OFFSET - 0.9;
-const CROSSWALK_DEPTH = CROSSWALK_OUTER_OFFSET - CROSSWALK_INNER_OFFSET;
-const STRIPE_WIDTH = 0.6;
-const STRIPE_GAP = 0.55;
+const GROUND_SURFACE_Y = -0.08;
+const ROAD_SURFACE_Y = 0;
+const INTERSECTION_SURFACE_Y = ROAD_SURFACE_Y + 0.01;
+const INTERSECTION_OUTLINE_Y = INTERSECTION_SURFACE_Y + 0.014;
+const MARKING_SURFACE_Y = 0.034;
+const STOP_LINE_SURFACE_Y = MARKING_SURFACE_Y + 0.001;
+const STOP_LINE_THICKNESS = 0.34;
 const DASH_LENGTH = 3.2;
 const DASH_GAP = 2.2;
-const TURN_ARC_SAMPLES = 40;
-const SLIP_SURFACE_SEGMENTS = 72;
-const SLIP_TAPER_SEGMENTS = 10;
-const SLIP_SURFACE_LIFT = 0.02;
-const SLIP_SURFACE_COLOR = "#1f2937";
-const SLIP_SURFACE_EMISSIVE = "#111827";
-const SLIP_ROAD_EDGE_OFFSET = (LANE_WIDTH / 2) + SHOULDER;
-const SLIP_BRANCH_CENTER_OFFSET = SHOULDER + LANE_WIDTH;
-const SLIP_IN_PLACE_ROTATION = Math.PI / 2;
+const ROAD_LABEL_DISTANCE = ROAD_EXTENT - 12;
+const ROAD_LABEL_HEIGHT = 2.4;
+const ROAD_LABEL_PLATE_SIZE = [16, 4.4];
+const SIGNAL_SIDE_OFFSET = ROAD_SURFACE_HALF_WIDTH + 3.4;
+const SIGNAL_SETBACK = 2.4;
+const INTERPOLATION_DELAY_MS = 18;
+const VEHICLE_POSITION_DAMPING = 22;
+const VEHICLE_ROTATION_DAMPING = 18;
 
 function shortestAngleLerp(start, end, alpha) {
   let delta = end - start;
@@ -65,23 +73,22 @@ function resolveBufferedFrames(frames, targetTime) {
   };
 }
 
-function sampleActor(frames, actorId, kind, now) {
-  const { previous, next, alpha } = resolveBufferedFrames(frames, now - 70);
-  if (!previous || !next) {
+function sampleResolvedActor(resolvedFrames, actorId) {
+  if (!resolvedFrames?.previous || !resolvedFrames?.next) {
     return null;
   }
 
-  const prevMap = kind === "vehicle" ? previous.vehicleMap : previous.pedestrianMap;
-  const nextMap = kind === "vehicle" ? next.vehicleMap : next.pedestrianMap;
+  const prevMap = resolvedFrames.previous.vehicleMap;
+  const nextMap = resolvedFrames.next.vehicleMap;
   const prevActor = prevMap.get(actorId);
   const nextActor = nextMap.get(actorId);
 
   if (prevActor && nextActor) {
     return {
       ...nextActor,
-      x: THREE.MathUtils.lerp(prevActor.x, nextActor.x, alpha),
-      y: THREE.MathUtils.lerp(prevActor.y, nextActor.y, alpha),
-      heading: kind === "vehicle" ? shortestAngleLerp(prevActor.heading, nextActor.heading, alpha) : 0,
+      x: THREE.MathUtils.lerp(prevActor.x, nextActor.x, resolvedFrames.alpha),
+      y: THREE.MathUtils.lerp(prevActor.y, nextActor.y, resolvedFrames.alpha),
+      heading: shortestAngleLerp(prevActor.heading, nextActor.heading, resolvedFrames.alpha),
     };
   }
 
@@ -90,11 +97,10 @@ function sampleActor(frames, actorId, kind, now) {
   }
 
   if (prevActor) {
-    const driftSeconds = Math.min(0.1, Math.max(0, (now - previous.receivedAt) / 1000));
     return {
       ...prevActor,
-      x: prevActor.x + ((prevActor.velocity_x ?? 0) * driftSeconds),
-      y: prevActor.y + ((prevActor.velocity_y ?? 0) * driftSeconds),
+      x: prevActor.x,
+      y: prevActor.y,
       heading: prevActor.heading ?? 0,
     };
   }
@@ -102,172 +108,37 @@ function sampleActor(frames, actorId, kind, now) {
   return null;
 }
 
+function FrameInterpolationCoordinator({ sceneBufferRef, resolvedFramesRef }) {
+  useFrame(() => {
+    resolvedFramesRef.current = resolveBufferedFrames(
+      sceneBufferRef.current.frames,
+      performance.now() - INTERPOLATION_DELAY_MS,
+    );
+  });
+  return null;
+}
+
+function laneDirection(lane) {
+  return lane.direction ?? lane.approach;
+}
+
 function laneHeading(lane) {
   const start = lane.path?.[0] ?? lane.start;
   const next = lane.path?.[1] ?? lane.end;
-  return Math.atan2(next.x - start.x, next.y - start.y);
+  return worldYawFromSimulationVector(next.x - start.x, next.y - start.y);
 }
 
 function laneLeftNormal(lane) {
   const start = lane.path?.[0] ?? lane.start;
   const next = lane.path?.[1] ?? lane.end;
-  const dx = next.x - start.x;
-  const dz = next.y - start.y;
-  const length = Math.hypot(dx, dz) || 1;
-  return { x: -dz / length, z: dx / length };
-}
-
-function normalize2D(dx, dy) {
-  const length = Math.hypot(dx, dy) || 1;
-  return { x: dx / length, y: dy / length };
-}
-
-function leftNormal2D(tangent) {
-  return { x: -tangent.y, y: tangent.x };
-}
-
-function offsetPoint2D(point, direction, distance) {
-  return {
-    x: point.x + (direction.x * distance),
-    y: point.y + (direction.y * distance),
-  };
-}
-
-function lerpPoint2D(start, end, alpha) {
-  return {
-    x: THREE.MathUtils.lerp(start.x, end.x, alpha),
-    y: THREE.MathUtils.lerp(start.y, end.y, alpha),
-  };
-}
-
-function rotatePoint2D(point, center, angle) {
-  const dx = point.x - center.x;
-  const dy = point.y - center.y;
-  const cosAngle = Math.cos(angle);
-  const sinAngle = Math.sin(angle);
-  return {
-    x: center.x + (dx * cosAngle) - (dy * sinAngle),
-    y: center.y + (dx * sinAngle) + (dy * cosAngle),
-  };
-}
-
-function rotateDirection2D(direction, angle) {
-  const cosAngle = Math.cos(angle);
-  const sinAngle = Math.sin(angle);
-  return normalize2D(
-    (direction.x * cosAngle) - (direction.y * sinAngle),
-    (direction.x * sinAngle) + (direction.y * cosAngle),
-  );
-}
-
-function blendDirection2D(start, end, alpha) {
-  return normalize2D(
-    THREE.MathUtils.lerp(start.x, end.x, alpha),
-    THREE.MathUtils.lerp(start.y, end.y, alpha),
-  );
-}
-
-function projectAlong(point, origin, tangent) {
-  return ((point.x - origin.x) * tangent.x) + ((point.y - origin.y) * tangent.y);
-}
-
-function arcTangentFromAngle(angle, clockwise) {
-  return clockwise
-    ? { x: Math.sin(angle), y: -Math.cos(angle) }
-    : { x: -Math.sin(angle), y: Math.cos(angle) };
-}
-
-function slipLaneVectors(lane) {
-  const entryTangent = normalize2D(lane.turn_entry.x - lane.start.x, lane.turn_entry.y - lane.start.y);
-  const exitTangent = normalize2D(lane.end.x - lane.turn_exit.x, lane.end.y - lane.turn_exit.y);
-  return {
-    entryTangent,
-    exitTangent,
-    entryNormal: leftNormal2D(entryTangent),
-    exitNormal: leftNormal2D(exitTangent),
-    entryLength: Math.hypot(lane.turn_entry.x - lane.start.x, lane.turn_entry.y - lane.start.y) || 1,
-    exitLength: Math.hypot(lane.end.x - lane.turn_exit.x, lane.end.y - lane.turn_exit.y) || 1,
-  };
-}
-
-function slipBranchCenterPoint(point, lane, tangent) {
-  return rotatePoint2D(
-    offsetPoint2D(point, leftNormal2D(tangent), SLIP_BRANCH_CENTER_OFFSET),
-    lane.arc.center,
-    SLIP_IN_PLACE_ROTATION,
-  );
-}
-
-function slipVisualState(point, lane) {
-  const {
-    entryTangent,
-    exitTangent,
-    entryLength,
-    exitLength,
-  } = slipLaneVectors(lane);
-  const beforeTurn = projectAlong(point, lane.turn_entry, entryTangent) <= 0;
-  if (beforeTurn) {
-    return {
-      section: "entry",
-      alpha: THREE.MathUtils.clamp(projectAlong(point, lane.start, entryTangent) / entryLength, 0, 1),
-      tangent: entryTangent,
-    };
-  }
-
-  const afterTurn = projectAlong(point, lane.turn_exit, exitTangent) >= 0;
-  if (afterTurn) {
-    const exitProgress = THREE.MathUtils.clamp(projectAlong(point, lane.turn_exit, exitTangent) / exitLength, 0, 1);
-    return {
-      section: "exit",
-      alpha: 1 - exitProgress,
-      tangent: exitTangent,
-    };
-  }
-
-  const angle = Math.atan2(point.y - lane.arc.center.y, point.x - lane.arc.center.x);
-  return {
-    section: "arc",
-    alpha: 1,
-    tangent: arcTangentFromAngle(angle, lane.arc.clockwise),
-  };
-}
-
-function slipVisualCenterPoint(point, lane) {
-  if (!lane?.arc || !lane.turn_entry || !lane.turn_exit) {
-    return point;
-  }
-
-  const state = slipVisualState(point, lane);
-  const branchPoint = slipBranchCenterPoint(point, lane, state.tangent);
-  return state.alpha >= 1 ? branchPoint : lerpPoint2D(point, branchPoint, state.alpha);
-}
-
-function slipVisualHeading(heading, point, lane) {
-  if (!lane?.arc || !lane.turn_entry || !lane.turn_exit) {
-    return heading ?? 0;
-  }
-  const state = slipVisualState(point, lane);
-  return (heading ?? 0) + (SLIP_IN_PLACE_ROTATION * state.alpha);
-}
-
-function pushUnique2DPoint(points, point) {
-  const previous = points[points.length - 1];
-  if (!previous) {
-    points.push(point);
-    return;
-  }
-  if (Math.hypot(previous.x - point.x, previous.y - point.y) > 1e-4) {
-    points.push(point);
-  }
+  const forward = simulationToWorldVector({ x: next.x - start.x, y: next.y - start.y });
+  return { x: -forward.z, z: forward.x };
 }
 
 function laneForward(lane) {
   const start = lane.path?.[0] ?? lane.start;
   const next = lane.path?.[1] ?? lane.end;
-  const dx = next.x - start.x;
-  const dz = next.y - start.y;
-  const length = Math.hypot(dx, dz) || 1;
-  return { x: dx / length, z: dz / length };
+  return simulationToWorldVector({ x: next.x - start.x, y: next.y - start.y });
 }
 
 function lightDescriptor(state, lamp) {
@@ -284,22 +155,6 @@ function signalStateForApproach(signals, approach) {
   return signals?.[approach] ?? "RED";
 }
 
-function isCrosswalkActive(crosswalk, activeCrosswalkIds) {
-  return activeCrosswalkIds.has(crosswalk.id);
-}
-
-function pedestrianFacing(pedestrian) {
-  const velocityX = pedestrian.velocity_x ?? 0;
-  const velocityY = pedestrian.velocity_y ?? 0;
-  if (Math.hypot(velocityX, velocityY) > 0.04) {
-    return Math.atan2(velocityX, velocityY);
-  }
-  if (pedestrian.crossing === "EW") {
-    return pedestrian.x <= 0 ? Math.PI / 2 : -Math.PI / 2;
-  }
-  return pedestrian.y <= 0 ? 0 : Math.PI;
-}
-
 function buildDashCenters(rangeStart, rangeEnd) {
   const centers = [];
   for (
@@ -312,55 +167,8 @@ function buildDashCenters(rangeStart, rangeEnd) {
   return centers;
 }
 
-function pushUniqueLanePoint(points, point) {
-  const previous = points[points.length - 1];
-  if (!previous) {
-    points.push(point);
-    return;
-  }
-  if (Math.hypot(previous[0] - point[0], previous[2] - point[2]) > 1e-4) {
-    points.push(point);
-  }
-}
-
-function laneDebugPoints(lane) {
-  const points = [];
-  const appendPoint2D = (point) => {
-    if (!point) {
-      return;
-    }
-    pushUniqueLanePoint(points, [point.x, 0.08, point.y]);
-  };
-
-  appendPoint2D(lane.start);
-
-  if (lane.arc && lane.turn_entry && lane.turn_exit) {
-    appendPoint2D(lane.turn_entry);
-    const curve = new THREE.EllipseCurve(
-      lane.arc.center.x,
-      lane.arc.center.y,
-      lane.arc.radius,
-      lane.arc.radius,
-      lane.arc.start_angle,
-      lane.arc.end_angle,
-      lane.arc.clockwise,
-      0,
-    );
-    curve.getPoints(TURN_ARC_SAMPLES).forEach((point) => {
-      pushUniqueLanePoint(points, [point.x, 0.08, point.y]);
-    });
-    appendPoint2D(lane.turn_exit);
-    appendPoint2D(lane.end);
-    return points;
-  }
-
-  (lane.path ?? []).forEach(appendPoint2D);
-  appendPoint2D(lane.end);
-  return points;
-}
-
 function stopLaneKey(lane) {
-  return `${lane.approach}:${lane.stop_line_position.x.toFixed(2)}:${lane.stop_line_position.y.toFixed(2)}`;
+  return `${laneDirection(lane)}:${lane.stop_line_position.x.toFixed(2)}:${lane.stop_line_position.y.toFixed(2)}`;
 }
 
 function uniquePhysicalLanes(lanes) {
@@ -373,6 +181,64 @@ function uniquePhysicalLanes(lanes) {
     seen.add(key);
     return true;
   });
+}
+
+function buildApproachMarkingDescriptor(lanes) {
+  const physicalLanes = uniquePhysicalLanes(lanes);
+  const representativeLane = physicalLanes.find((lane) => lane.movement === "STRAIGHT") ?? physicalLanes[0];
+  const direction = laneDirection(representativeLane);
+  const leftNormal = laneLeftNormal(representativeLane);
+  const forward = laneForward(representativeLane);
+  const stopPoint = physicalLanes.reduce(
+    (accumulator, lane) => ({
+      x: accumulator.x + lane.stop_line_position.x,
+      y: accumulator.y + lane.stop_line_position.y,
+    }),
+    { x: 0, y: 0 },
+  );
+  stopPoint.x /= physicalLanes.length;
+  stopPoint.y /= physicalLanes.length;
+  const vertical = isVerticalDirection(direction);
+
+  return {
+    direction,
+    facing: laneHeading(representativeLane) + Math.PI,
+    forward,
+    leftNormal,
+    roadsideNormal: vertical
+      ? { x: Math.sign(stopPoint.x || leftNormal.x || 1), z: 0 }
+      : { x: 0, z: Math.sign(-stopPoint.y || leftNormal.z || 1) },
+    physicalLanes,
+    stopPoint,
+    laneSpan: physicalLanes.length * LANE_WIDTH,
+    vertical,
+  };
+}
+
+function buildRoadLabelDescriptors(lanes, directionAxes) {
+  const lanesByDirection = lanes.reduce((groups, lane) => {
+    const direction = laneDirection(lane);
+    if (!direction) {
+      return groups;
+    }
+    groups[direction] = groups[direction] ?? [];
+    groups[direction].push(lane);
+    return groups;
+  }, {});
+
+  return Object.keys(lanesByDirection)
+    .map((direction) => {
+      const axis = directionAxis(direction, directionAxes);
+      if (!axis) {
+        return null;
+      }
+      return {
+        direction,
+        axis,
+        position: worldPointForDirection(direction, ROAD_LABEL_DISTANCE, ROAD_LABEL_HEIGHT, directionAxes),
+      };
+    })
+    .filter(Boolean);
 }
 
 function dividerSegments() {
@@ -404,6 +270,17 @@ function dividerSegments() {
   });
 
   return segments;
+}
+
+function roadSurfaceSegments() {
+  const armLength = ROAD_SURFACE_HALF_LENGTH - INTERSECTION_HALF_SIZE;
+  const armCenter = (ROAD_SURFACE_HALF_LENGTH + INTERSECTION_HALF_SIZE) / 2;
+  return [
+    { id: "road-north", position: [0, ROAD_SURFACE_Y, armCenter], size: [ROAD_SURFACE_WIDTH, armLength] },
+    { id: "road-south", position: [0, ROAD_SURFACE_Y, -armCenter], size: [ROAD_SURFACE_WIDTH, armLength] },
+    { id: "road-east", position: [armCenter, ROAD_SURFACE_Y, 0], size: [armLength, ROAD_SURFACE_WIDTH] },
+    { id: "road-west", position: [-armCenter, ROAD_SURFACE_Y, 0], size: [armLength, ROAD_SURFACE_WIDTH] },
+  ];
 }
 
 function PersistentOrbitController({ cameraStateRef }) {
@@ -439,29 +316,17 @@ function SurfaceStripe({ segment }) {
 }
 
 function buildSignalDescriptor(lanes, signals) {
-  const physicalLanes = uniquePhysicalLanes(lanes);
-  const representativeLane = physicalLanes.find((lane) => lane.movement === "STRAIGHT") ?? physicalLanes[0];
-  const leftNormal = laneLeftNormal(representativeLane);
-  const forward = laneForward(representativeLane);
-  const stopPoint = physicalLanes.reduce(
-    (accumulator, lane) => ({
-      x: accumulator.x + lane.stop_line_position.x,
-      y: accumulator.y + lane.stop_line_position.y,
-    }),
-    { x: 0, y: 0 },
-  );
-  stopPoint.x /= physicalLanes.length;
-  stopPoint.y /= physicalLanes.length;
+  const descriptor = buildApproachMarkingDescriptor(lanes);
 
   return {
-    id: representativeLane.approach,
-    state: signalStateForApproach(signals, representativeLane.approach),
+    id: descriptor.direction,
+    state: signalStateForApproach(signals, descriptor.direction),
     position: [
-      stopPoint.x + (leftNormal.x * 4.2) - (forward.x * 1.6),
+      descriptor.stopPoint.x + (descriptor.roadsideNormal.x * SIGNAL_SIDE_OFFSET) - (descriptor.forward.x * SIGNAL_SETBACK),
       0,
-      stopPoint.y + (leftNormal.z * 4.2) - (forward.z * 1.6),
+      -descriptor.stopPoint.y + (descriptor.roadsideNormal.z * SIGNAL_SIDE_OFFSET) - (descriptor.forward.z * SIGNAL_SETBACK),
     ],
-    facing: laneHeading(representativeLane) + Math.PI,
+    facing: descriptor.facing,
   };
 }
 
@@ -473,219 +338,110 @@ function SignalHead({ signal }) {
 
   return (
     <group position={position} rotation={[0, facing, 0]}>
-      <mesh position={[0, 3.2, 0]} castShadow>
-        <cylinderGeometry args={[0.16, 0.2, 6.4, 14]} />
-        <meshStandardMaterial color="#334155" metalness={0.35} roughness={0.6} />
+      <mesh position={[0, 0.14, 0]}>
+        <cylinderGeometry args={[0.34, 0.44, 0.28, 12]} />
+        <meshStandardMaterial color="#64748b" roughness={0.92} />
       </mesh>
-      <mesh position={[0.44, 5.9, 0]} castShadow>
-        <boxGeometry args={[1.18, 3.1, 1.04]} />
-        <meshStandardMaterial color="#0f172a" metalness={0.3} roughness={0.58} />
+      <mesh position={[0, 3.4, 0]}>
+        <cylinderGeometry args={[0.1, 0.12, 6.8, 12]} />
+        <meshStandardMaterial color="#475569" roughness={0.62} />
       </mesh>
-      <mesh position={[0.44, 6.52, 0.6]} castShadow>
-        <sphereGeometry args={[0.24, 18, 18]} />
+      <mesh position={[0, 6.84, 0]}>
+        <sphereGeometry args={[0.11, 10, 10]} />
+        <meshStandardMaterial color="#94a3b8" roughness={0.58} />
+      </mesh>
+      <mesh position={[0, 5.24, -0.02]}>
+        <boxGeometry args={[1.24, 3.08, 0.16]} />
+        <meshStandardMaterial color="#334155" roughness={0.72} />
+      </mesh>
+      <mesh position={[0, 5.24, 0.2]}>
+        <boxGeometry args={[0.96, 2.7, 0.62]} />
+        <meshStandardMaterial color="#0f172a" roughness={0.56} />
+      </mesh>
+      <mesh position={[0, 5.24, 0.44]}>
+        <boxGeometry args={[1.04, 2.86, 0.04]} />
+        <meshStandardMaterial color="#020617" roughness={0.82} transparent opacity={0.78} />
+      </mesh>
+      <mesh position={[0, 5.24, 0.02]}>
+        <boxGeometry args={[0.12, 2.86, 0.12]} />
+        <meshStandardMaterial color="#1e293b" roughness={0.64} />
+      </mesh>
+      <mesh position={[0, 6.1, 0.36]}>
+        <boxGeometry args={[0.5, 0.3, 0.26]} />
+        <meshStandardMaterial color="#020617" roughness={0.82} />
+      </mesh>
+      <mesh position={[0, 5.24, 0.36]}>
+        <boxGeometry args={[0.5, 0.3, 0.26]} />
+        <meshStandardMaterial color="#020617" roughness={0.82} />
+      </mesh>
+      <mesh position={[0, 4.38, 0.36]}>
+        <boxGeometry args={[0.5, 0.3, 0.26]} />
+        <meshStandardMaterial color="#020617" roughness={0.82} />
+      </mesh>
+      <mesh position={[0, 6.1, 0.48]}>
+        <sphereGeometry args={[0.2, 12, 12]} />
         <meshStandardMaterial color={redLight.color} emissive={redLight.emissive} emissiveIntensity={redLight.intensity} />
       </mesh>
-      <mesh position={[0.44, 5.6, 0.6]} castShadow>
-        <sphereGeometry args={[0.24, 18, 18]} />
+      <mesh position={[0, 5.24, 0.48]}>
+        <sphereGeometry args={[0.2, 12, 12]} />
         <meshStandardMaterial color={yellowLight.color} emissive={yellowLight.emissive} emissiveIntensity={yellowLight.intensity} />
       </mesh>
-      <mesh position={[0.44, 4.68, 0.6]} castShadow>
-        <sphereGeometry args={[0.24, 18, 18]} />
+      <mesh position={[0, 4.38, 0.48]}>
+        <sphereGeometry args={[0.2, 12, 12]} />
         <meshStandardMaterial color={greenLight.color} emissive={greenLight.emissive} emissiveIntensity={greenLight.intensity} />
       </mesh>
-    </group>
-  );
-}
-
-function Crosswalk({ crosswalk, active }) {
-  const horizontal = Math.abs(crosswalk.end.x - crosswalk.start.x) > Math.abs(crosswalk.end.y - crosswalk.start.y);
-  const stripeSpan = horizontal
-    ? Math.abs(crosswalk.end.x - crosswalk.start.x)
-    : Math.abs(crosswalk.end.y - crosswalk.start.y);
-  const center = {
-    x: (crosswalk.start.x + crosswalk.end.x) / 2,
-    y: (crosswalk.start.y + crosswalk.end.y) / 2,
-  };
-  const stripePitch = STRIPE_WIDTH + STRIPE_GAP;
-  const stripeCount = Math.max(1, Math.floor((CROSSWALK_DEPTH + STRIPE_GAP) / stripePitch));
-  const usedDepth = (stripeCount * STRIPE_WIDTH) + ((stripeCount - 1) * STRIPE_GAP);
-  const firstStripeOffset = -((usedDepth - STRIPE_WIDTH) / 2);
-
-  return (
-    <group>
-      <mesh position={[center.x, 0.024, center.y]} rotation={[-Math.PI / 2, 0, 0]}>
-        <planeGeometry args={horizontal ? [stripeSpan, CROSSWALK_DEPTH] : [CROSSWALK_DEPTH, stripeSpan]} />
-        <meshStandardMaterial color="#273243" roughness={0.96} metalness={0.04} />
+      <mesh position={[0.38, 1.36, -0.02]}>
+        <boxGeometry args={[0.34, 0.68, 0.26]} />
+        <meshStandardMaterial color="#1e293b" roughness={0.72} />
       </mesh>
-      {Array.from({ length: stripeCount }, (_, index) => {
-        const offset = firstStripeOffset + (index * stripePitch);
-        const position = horizontal
-          ? [center.x, 0.031, center.y + offset]
-          : [center.x + offset, 0.031, center.y];
-        return (
-          <mesh key={`${crosswalk.id}-${index}`} position={position} rotation={[-Math.PI / 2, 0, 0]}>
-            <planeGeometry args={horizontal ? [stripeSpan, STRIPE_WIDTH] : [STRIPE_WIDTH, stripeSpan]} />
-            <meshStandardMaterial color="#f8fafc" emissive={active ? "#86efac" : "#e2e8f0"} emissiveIntensity={active ? 0.48 : 0.08} />
-          </mesh>
-        );
-      })}
     </group>
   );
 }
 
 function StopLine({ lanes }) {
-  const physicalLanes = uniquePhysicalLanes(lanes);
-  const stopPoint = physicalLanes.reduce(
-    (accumulator, lane) => ({
-      x: accumulator.x + lane.stop_line_position.x,
-      y: accumulator.y + lane.stop_line_position.y,
-    }),
-    { x: 0, y: 0 },
-  );
-  stopPoint.x /= physicalLanes.length;
-  stopPoint.y /= physicalLanes.length;
-  const vertical = physicalLanes[0].approach === "NORTH" || physicalLanes[0].approach === "SOUTH";
+  const descriptor = buildApproachMarkingDescriptor(lanes);
 
   return (
-    <mesh position={[stopPoint.x, 0.032, stopPoint.y]} rotation={[-Math.PI / 2, 0, 0]}>
-      <planeGeometry args={vertical ? [physicalLanes.length * LANE_WIDTH, 0.44] : [0.44, physicalLanes.length * LANE_WIDTH]} />
+    <mesh position={[descriptor.stopPoint.x, STOP_LINE_SURFACE_Y, -descriptor.stopPoint.y]} rotation={[-Math.PI / 2, 0, 0]}>
+      <planeGeometry args={descriptor.vertical ? [descriptor.laneSpan, STOP_LINE_THICKNESS] : [STOP_LINE_THICKNESS, descriptor.laneSpan]} />
       <meshStandardMaterial color="#f8fafc" emissive="#ffffff" emissiveIntensity={0.12} />
     </mesh>
   );
 }
 
-function SlipLaneSurface({ lane }) {
-  const geometry = useMemo(() => {
-    const localize = (point) => ({
-      x: point.x - lane.arc.center.x,
-      y: point.y - lane.arc.center.y,
-    });
-    const TAU = Math.PI * 2;
-    const normalizeAngleSpan = (value) => {
-      const span = ((value % TAU) + TAU) % TAU;
-      return span > 1e-6 ? span : TAU;
-    };
-    const angleSpan = normalizeAngleSpan(
-      lane.arc.clockwise
-        ? lane.arc.start_angle - lane.arc.end_angle
-        : lane.arc.end_angle - lane.arc.start_angle,
-    );
-    const { entryTangent, exitTangent } = slipLaneVectors(lane);
-    const outerBoundary = [];
-    const innerBoundary = [];
-    const pushBranchProfile = (centerPoint, tangent, widthRatio) => {
-      const normal = leftNormal2D(tangent);
-      const innerPoint = offsetPoint2D(centerPoint, normal, SLIP_ROAD_EDGE_OFFSET * widthRatio);
-      const outerPoint = offsetPoint2D(innerPoint, normal, LANE_WIDTH * widthRatio);
-      pushUnique2DPoint(innerBoundary, localize(innerPoint));
-      pushUnique2DPoint(outerBoundary, localize(outerPoint));
-    };
-
-    for (let index = 0; index <= SLIP_TAPER_SEGMENTS; index += 1) {
-      const ratio = index / SLIP_TAPER_SEGMENTS;
-      const point = lerpPoint2D(lane.start, lane.turn_entry, ratio);
-      const branchPoint = slipBranchCenterPoint(point, lane, entryTangent);
-      const branchTangent = rotateDirection2D(entryTangent, SLIP_IN_PLACE_ROTATION);
-      pushBranchProfile(
-        lerpPoint2D(point, branchPoint, ratio),
-        blendDirection2D(entryTangent, branchTangent, ratio),
-        ratio,
-      );
-    }
-
-    for (let index = 1; index < SLIP_SURFACE_SEGMENTS; index += 1) {
-      const ratio = index / SLIP_SURFACE_SEGMENTS;
-      const angle = lane.arc.clockwise
-        ? lane.arc.start_angle - (angleSpan * ratio)
-        : lane.arc.start_angle + (angleSpan * ratio);
-      const point = {
-        x: lane.arc.center.x + (lane.arc.radius * Math.cos(angle)),
-        y: lane.arc.center.y + (lane.arc.radius * Math.sin(angle)),
-      };
-      const tangent = arcTangentFromAngle(angle, lane.arc.clockwise);
-      pushBranchProfile(
-        slipBranchCenterPoint(point, lane, tangent),
-        rotateDirection2D(tangent, SLIP_IN_PLACE_ROTATION),
-        1,
-      );
-    }
-
-    for (let index = 0; index <= SLIP_TAPER_SEGMENTS; index += 1) {
-      const ratio = index / SLIP_TAPER_SEGMENTS;
-      const point = lerpPoint2D(lane.turn_exit, lane.end, ratio);
-      const branchPoint = slipBranchCenterPoint(point, lane, exitTangent);
-      const branchTangent = rotateDirection2D(exitTangent, SLIP_IN_PLACE_ROTATION);
-      const branchRatio = 1 - ratio;
-      pushBranchProfile(
-        lerpPoint2D(point, branchPoint, branchRatio),
-        blendDirection2D(exitTangent, branchTangent, branchRatio),
-        branchRatio,
-      );
-    }
-
-    const shape = new THREE.Shape();
-    shape.moveTo(outerBoundary[0].x, outerBoundary[0].y);
-    outerBoundary.slice(1).forEach((point) => {
-      shape.lineTo(point.x, point.y);
-    });
-    innerBoundary.slice().reverse().forEach((point) => {
-      shape.lineTo(point.x, point.y);
-    });
-    shape.closePath();
-    return new THREE.ShapeGeometry(shape, SLIP_SURFACE_SEGMENTS);
-  }, [
-    lane.end.x,
-    lane.end.y,
-    lane.arc.center.x,
-    lane.arc.center.y,
-    lane.arc.clockwise,
-    lane.arc.end_angle,
-    lane.arc.start_angle,
-    lane.start.x,
-    lane.start.y,
-    lane.turn_entry.x,
-    lane.turn_entry.y,
-    lane.turn_exit.x,
-    lane.turn_exit.y,
-  ]);
-
-  useEffect(() => () => geometry.dispose(), [geometry]);
-
+function RoadDirectionLabel({ label }) {
   return (
-    <mesh position={[lane.arc.center.x, SLIP_SURFACE_LIFT, lane.arc.center.y]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
-      <primitive object={geometry} attach="geometry" />
-      <meshStandardMaterial
-        color={SLIP_SURFACE_COLOR}
-        emissive={SLIP_SURFACE_EMISSIVE}
-        emissiveIntensity={0.08}
-        roughness={0.96}
-        metalness={0.05}
-        side={THREE.DoubleSide}
-        polygonOffset
-        polygonOffsetFactor={-2}
-        polygonOffsetUnits={-2}
-      />
-    </mesh>
+    <Billboard position={label.position} follow lockX lockZ>
+      <group>
+        <mesh position={[0, 0, -0.04]}>
+          <planeGeometry args={ROAD_LABEL_PLATE_SIZE} />
+          <meshStandardMaterial color="#08131f" emissive="#0f766e" emissiveIntensity={0.18} transparent opacity={0.9} />
+        </mesh>
+        <Text
+          anchorX="center"
+          anchorY="middle"
+          fontSize={1.48}
+          color="#f8fafc"
+          outlineWidth={0.08}
+          outlineColor="#020617"
+          letterSpacing={0.08}
+          maxWidth={ROAD_LABEL_PLATE_SIZE[0] - 2}
+        >
+          {label.direction}
+        </Text>
+      </group>
+    </Billboard>
   );
 }
 
-function PathDebugLine({ lane }) {
-  const points = useMemo(() => laneDebugPoints(lane), [lane]);
-  const color = lane.movement === "RIGHT" ? "#f59e0b" : lane.movement === "LEFT" ? "#34d399" : "#7dd3fc";
-  return <Line points={points} color={color} transparent opacity={0.28} lineWidth={1.4} />;
-}
-
-function RoadNetwork({ lanes, crosswalks, pedestrians, signals }) {
+function RoadNetwork({ lanes, signals, directionAxes }) {
   const stripes = useMemo(() => dividerSegments(), []);
-  const mainLanes = useMemo(() => lanes.filter((lane) => lane.kind !== "slip"), [lanes]);
-  const slipLanes = useMemo(() => lanes.filter((lane) => lane.kind === "slip" && lane.arc), [lanes]);
-  const activeCrosswalkIds = useMemo(
-    () => new Set(pedestrians.filter((pedestrian) => pedestrian.state === "CROSSING").map((pedestrian) => pedestrian.crosswalk_id)),
-    [pedestrians],
-  );
-  const lanesByApproach = mainLanes.reduce((groups, lane) => {
-    groups[lane.approach] = groups[lane.approach] ?? [];
-    groups[lane.approach].push(lane);
+  const roadSurfaces = useMemo(() => roadSurfaceSegments(), []);
+  const roadLabels = useMemo(() => buildRoadLabelDescriptors(lanes, directionAxes), [lanes, directionAxes]);
+  const lanesByApproach = lanes.reduce((groups, lane) => {
+    const direction = laneDirection(lane);
+    groups[direction] = groups[direction] ?? [];
+    groups[direction].push(lane);
     return groups;
   }, {});
   const stopLineGroups = Object.values(lanesByApproach);
@@ -696,57 +452,46 @@ function RoadNetwork({ lanes, crosswalks, pedestrians, signals }) {
     }, {}),
   );
   const intersectionOutline = [
-    [-INTERSECTION_HALF_SIZE, 0.05, -INTERSECTION_HALF_SIZE],
-    [-INTERSECTION_HALF_SIZE, 0.05, INTERSECTION_HALF_SIZE],
-    [INTERSECTION_HALF_SIZE, 0.05, INTERSECTION_HALF_SIZE],
-    [INTERSECTION_HALF_SIZE, 0.05, -INTERSECTION_HALF_SIZE],
-    [-INTERSECTION_HALF_SIZE, 0.05, -INTERSECTION_HALF_SIZE],
+    [-INTERSECTION_HALF_SIZE, INTERSECTION_OUTLINE_Y, -INTERSECTION_HALF_SIZE],
+    [-INTERSECTION_HALF_SIZE, INTERSECTION_OUTLINE_Y, INTERSECTION_HALF_SIZE],
+    [INTERSECTION_HALF_SIZE, INTERSECTION_OUTLINE_Y, INTERSECTION_HALF_SIZE],
+    [INTERSECTION_HALF_SIZE, INTERSECTION_OUTLINE_Y, -INTERSECTION_HALF_SIZE],
+    [-INTERSECTION_HALF_SIZE, INTERSECTION_OUTLINE_Y, -INTERSECTION_HALF_SIZE],
   ];
 
   return (
     <group>
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.08, 0]} receiveShadow>
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, GROUND_SURFACE_Y, 0]}>
         <planeGeometry args={[210, 210]} />
-        <meshStandardMaterial color="#0b1725" />
+        <meshBasicMaterial color="#0b1725" />
       </mesh>
 
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.004, 0]} receiveShadow>
-        <planeGeometry args={[ROAD_SURFACE_WIDTH, ROAD_SURFACE_LENGTH]} />
-        <meshStandardMaterial color="#1f2937" roughness={0.96} metalness={0.05} />
-      </mesh>
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.004, 0]} receiveShadow>
-        <planeGeometry args={[ROAD_SURFACE_LENGTH, ROAD_SURFACE_WIDTH]} />
-        <meshStandardMaterial color="#1f2937" roughness={0.96} metalness={0.05} />
-      </mesh>
+      {roadSurfaces.map((segment) => (
+        <mesh key={segment.id} rotation={[-Math.PI / 2, 0, 0]} position={segment.position}>
+          <planeGeometry args={segment.size} />
+          <meshBasicMaterial color="#1f2937" />
+        </mesh>
+      ))}
 
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.008, 0]} receiveShadow>
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, INTERSECTION_SURFACE_Y, 0]}>
         <planeGeometry args={[INTERSECTION_SIZE, INTERSECTION_SIZE]} />
-        <meshStandardMaterial color="#2a3545" roughness={0.88} metalness={0.05} />
+        <meshBasicMaterial color="#2a3545" />
       </mesh>
       <Line points={intersectionOutline} color="#f8fafc" transparent opacity={0.35} lineWidth={1.2} />
 
       {stripes.map((segment) => (
         <SurfaceStripe key={segment.id} segment={segment} />
       ))}
-
-      {slipLanes.map((lane) => (
-        <SlipLaneSurface key={`slip-surface-${lane.id}`} lane={lane} />
-      ))}
-
-      {crosswalks.map((crosswalk) => (
-        <Crosswalk
-          key={crosswalk.id}
-          crosswalk={crosswalk}
-          active={isCrosswalkActive(crosswalk, activeCrosswalkIds)}
-        />
-      ))}
-
       {stopLineGroups.map((group) => (
-        <StopLine key={`stop-${group[0].approach}`} lanes={group} />
+        <StopLine key={`stop-${laneDirection(group[0])}`} lanes={group} />
       ))}
 
       {signalDescriptors.map((signal) => (
         <SignalHead key={`signal-${signal.id}`} signal={signal} />
+      ))}
+
+      {roadLabels.map((label) => (
+        <RoadDirectionLabel key={`road-label-${label.direction}`} label={label} />
       ))}
     </group>
   );
@@ -761,6 +506,73 @@ function vehicleAppearance(vehicle) {
     detailColor: "#cbd5e1",
     shadowScale: [width * 0.55, length * 0.4, 1],
   };
+}
+
+function emergencyLightPalette(vehicle) {
+  if (!vehicle.has_siren) {
+    return [];
+  }
+  if (vehicle.kind === "ambulance") {
+    return [
+      { color: "#ef4444", phase: 0 },
+      { color: "#2563eb", phase: Math.PI },
+    ];
+  }
+  if (vehicle.kind === "firetruck") {
+    return [{ color: "#fca5a5", phase: 0 }];
+  }
+  if (vehicle.kind === "police") {
+    return [
+      { color: "#60a5fa", phase: 0 },
+      { color: "#dbeafe", phase: Math.PI },
+    ];
+  }
+  return [];
+}
+
+function EmergencyLightBar({ vehicle, appearance }) {
+  const lightRefs = useRef([]);
+  const lights = emergencyLightPalette(vehicle);
+
+  useFrame((renderState) => {
+    if (!lights.length) {
+      return;
+    }
+    const phaseTime = renderState.clock.getElapsedTime() * 9;
+    lightRefs.current.forEach((material, index) => {
+      if (!material) {
+        return;
+      }
+      const pulse = Math.sin(phaseTime + lights[index].phase);
+      material.emissiveIntensity = pulse > 0 ? 2.4 : 0.22;
+      material.opacity = pulse > 0 ? 0.98 : 0.58;
+    });
+  });
+
+  if (!lights.length) {
+    return null;
+  }
+
+  const slotOffsets = lights.length === 1 ? [0] : [-0.18, 0.18];
+  return (
+    <group position={[0, appearance.footprint[1] * 0.8, 0]}>
+      {lights.map((light, index) => (
+        <mesh key={`${vehicle.kind}-${light.color}`} position={[slotOffsets[index] ?? 0, 0, -0.04]}>
+          <boxGeometry args={[0.22, 0.08, 0.38]} />
+          <meshStandardMaterial
+            ref={(material) => {
+              lightRefs.current[index] = material;
+            }}
+            color={light.color}
+            emissive={light.color}
+            emissiveIntensity={0.3}
+            transparent
+            opacity={0.7}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
 }
 
 function VehicleShell({ vehicle, appearance }) {
@@ -778,22 +590,37 @@ function VehicleShell({ vehicle, appearance }) {
         <boxGeometry args={[appearance.footprint[0] * 0.78, 0.08, appearance.footprint[2] * 0.16]} />
         <meshStandardMaterial color={appearance.detailColor} roughness={0.36} />
       </mesh>
+      <EmergencyLightBar vehicle={vehicle} appearance={appearance} />
     </group>
   );
 }
 
-function VehicleActor({ id, laneMap, sceneBufferRef, initial }) {
+function VehicleActor({ id, resolvedFramesRef, initial }) {
   const groupRef = useRef();
 
-  useFrame(() => {
-    const sampled = sampleActor(sceneBufferRef.current.frames, id, "vehicle", performance.now());
+  useFrame((_, delta) => {
+    const sampled = sampleResolvedActor(resolvedFramesRef.current, id);
     if (!sampled || !groupRef.current) {
       return;
     }
-    const lane = laneMap[sampled.lane_id];
-    const renderPoint = lane?.kind === "slip" ? slipVisualCenterPoint({ x: sampled.x, y: sampled.y }, lane) : sampled;
-    groupRef.current.position.set(renderPoint.x, 0.9, renderPoint.y);
-    groupRef.current.rotation.y = lane?.kind === "slip" ? slipVisualHeading(sampled.heading, { x: sampled.x, y: sampled.y }, lane) : (sampled.heading ?? 0);
+    const group = groupRef.current;
+    const targetX = sampled.x;
+    const targetZ = -sampled.y;
+    const positionAlpha = 1 - Math.exp(-VEHICLE_POSITION_DAMPING * delta);
+    const rotationAlpha = 1 - Math.exp(-VEHICLE_ROTATION_DAMPING * delta);
+    const offsetX = targetX - group.position.x;
+    const offsetZ = targetZ - group.position.z;
+
+    if ((offsetX * offsetX) + (offsetZ * offsetZ) > 49) {
+      group.position.set(targetX, 0.9, targetZ);
+    } else {
+      group.position.x = THREE.MathUtils.lerp(group.position.x, targetX, positionAlpha);
+      group.position.z = THREE.MathUtils.lerp(group.position.z, targetZ, positionAlpha);
+      group.position.y = 0.9;
+    }
+
+    const targetHeading = worldYawFromSimulationHeading(sampled.heading ?? 0);
+    group.rotation.y = shortestAngleLerp(group.rotation.y, targetHeading, rotationAlpha);
   });
 
   if (!initial) {
@@ -801,12 +628,10 @@ function VehicleActor({ id, laneMap, sceneBufferRef, initial }) {
   }
 
   const appearance = vehicleAppearance(initial);
-  const initialLane = laneMap[initial.lane_id];
-  const initialPoint = initialLane?.kind === "slip" ? slipVisualCenterPoint({ x: initial.x, y: initial.y }, initialLane) : initial;
-  const initialHeading = initialLane?.kind === "slip" ? slipVisualHeading(initial.heading, { x: initial.x, y: initial.y }, initialLane) : (initial.heading ?? 0);
+  const initialHeading = worldYawFromSimulationHeading(initial.heading ?? 0);
 
   return (
-    <group ref={groupRef} position={[initialPoint.x, 0.9, initialPoint.y]} rotation={[0, initialHeading, 0]}>
+    <group ref={groupRef} position={[initial.x, 0.9, -initial.y]} rotation={[0, initialHeading, 0]}>
       <mesh position={[0, -0.86, 0]} rotation={[-Math.PI / 2, 0, 0]} scale={appearance.shadowScale}>
         <circleGeometry args={[1, 24]} />
         <meshBasicMaterial color="#020617" transparent opacity={0.24} />
@@ -816,109 +641,63 @@ function VehicleActor({ id, laneMap, sceneBufferRef, initial }) {
   );
 }
 
-function PedestrianActor({ id, sceneBufferRef, initial }) {
-  const rootRef = useRef();
-  const bodyRef = useRef();
-  const leftLegRef = useRef();
-  const rightLegRef = useRef();
-  const phaseOffsetRef = useRef((Number(id.replace(/\D/g, "")) || 1) * 0.5);
-
-  useFrame((renderState) => {
-    const sampled = sampleActor(sceneBufferRef.current.frames, id, "pedestrian", performance.now());
-    if (!sampled || !rootRef.current) {
-      return;
-    }
-
-    const elapsed = renderState.clock.getElapsedTime() + phaseOffsetRef.current;
-    const crossing = sampled.state !== "WAITING";
-    const swing = crossing ? Math.sin(elapsed * 8) * 0.4 : 0;
-    const bob = crossing ? Math.sin(elapsed * 8) * 0.04 : 0;
-
-    rootRef.current.position.set(sampled.x, 0, sampled.y);
-    rootRef.current.rotation.y = pedestrianFacing(sampled);
-
-    if (bodyRef.current) {
-      bodyRef.current.position.y = 0.02 + bob;
-    }
-    if (leftLegRef.current) {
-      leftLegRef.current.rotation.x = -swing;
-    }
-    if (rightLegRef.current) {
-      rightLegRef.current.rotation.x = swing;
-    }
-  });
-
-  if (!initial) {
-    return null;
-  }
+/* Legacy compass removed in favor of world-anchored road labels.
+function DirectionCompass({ directionAxes }) {
+  const axes = directionAxes ?? WORLD_DIRECTION_AXES;
+  const northLabel = axes.NORTH?.z === -1 ? "N" : "N?";
+  const southLabel = axes.SOUTH?.z === 1 ? "S" : "S?";
+  const eastLabel = axes.EAST?.x === 1 ? "E" : "E?";
+  const westLabel = axes.WEST?.x === -1 ? "W" : "W?";
 
   return (
-    <group ref={rootRef} position={[initial.x, 0, initial.y]} rotation={[0, pedestrianFacing(initial), 0]} scale={[initial.body_scale ?? 1, initial.body_scale ?? 1, initial.body_scale ?? 1]}>
-      <mesh position={[0, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]} scale={[0.35, 0.5, 1]}>
-        <circleGeometry args={[1, 18]} />
-        <meshBasicMaterial color="#020617" transparent opacity={0.2} />
-      </mesh>
-      <group ref={bodyRef} position={[0, 0.02, 0]}>
-        <group ref={leftLegRef} position={[-0.1, 0.32, 0]}>
-          <mesh castShadow>
-            <cylinderGeometry args={[0.06, 0.07, 0.5, 10]} />
-            <meshStandardMaterial color={initial.pants_color ?? "#334155"} roughness={0.72} />
-          </mesh>
-        </group>
-        <group ref={rightLegRef} position={[0.1, 0.32, 0]}>
-          <mesh castShadow>
-            <cylinderGeometry args={[0.06, 0.07, 0.5, 10]} />
-            <meshStandardMaterial color={initial.pants_color ?? "#334155"} roughness={0.72} />
-          </mesh>
-        </group>
-        <mesh position={[0, 0.86, 0]} castShadow>
-          <capsuleGeometry args={[0.18, 0.48, 6, 10]} />
-          <meshStandardMaterial color={initial.shirt_color ?? "#fb923c"} roughness={0.42} metalness={0.06} />
-        </mesh>
-        <mesh position={[0, 1.44, 0]} castShadow>
-          <sphereGeometry args={[0.18, 16, 16]} />
-          <meshStandardMaterial color="#f8d5b8" roughness={0.82} />
-        </mesh>
-      </group>
-    </group>
+    <div className="pointer-events-none absolute right-4 top-4 z-10 rounded-3xl border border-white/10 bg-slate-950/75 px-4 py-3 text-[11px] text-slate-200 shadow-2xl backdrop-blur">
+      <p className="text-[10px] uppercase tracking-[0.28em] text-cyan-300">World Compass</p>
+      <div className="relative mt-3 h-20 w-20 rounded-full border border-white/10 bg-white/[0.03]">
+        <span className="absolute left-1/2 top-2 -translate-x-1/2 text-sm font-semibold text-white">{northLabel} ↑</span>
+        <span className="absolute right-2 top-1/2 -translate-y-1/2 text-sm font-semibold text-white">{eastLabel} →</span>
+        <span className="absolute bottom-2 left-1/2 -translate-x-1/2 text-sm font-semibold text-white">{southLabel} ↓</span>
+        <span className="absolute left-2 top-1/2 -translate-y-1/2 text-sm font-semibold text-white">{westLabel} ←</span>
+        <div className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-300" />
+      </div>
+      <p className="mt-3 text-[10px] text-slate-400">N=-Z, S=+Z, E=+X, W=-X</p>
+    </div>
   );
 }
+*/
 
-export default function SimulationCanvas({ sceneSnapshot, sceneBufferRef, cameraStateRef }) {
-  const laneMap = useMemo(
-    () => Object.fromEntries(sceneSnapshot.lanes.map((lane) => [lane.id, lane])),
-    [sceneSnapshot.lanes],
-  );
+export default function SimulationCanvas({ sceneSnapshot, sceneBufferRef, cameraStateRef, className = "" }) {
+  const resolvedFramesRef = useRef({
+    previous: null,
+    next: null,
+    alpha: 0,
+  });
 
   return (
-    <div className="glass-panel h-[680px] overflow-hidden rounded-[2rem]">
-      <Canvas shadows camera={{ position: cameraStateRef.current.position, fov: 42 }}>
+    <div className={`glass-panel relative overflow-hidden rounded-[2rem] ${className || "h-[680px]"}`}>
+      <Canvas
+        camera={{ position: cameraStateRef.current.position, fov: 42 }}
+        dpr={[1, 1.2]}
+        gl={{ antialias: false, powerPreference: "high-performance" }}
+        frameloop="always"
+      >
         <color attach="background" args={["#08131f"]} />
         <fog attach="fog" args={["#08131f", 86, 190]} />
         <ambientLight intensity={0.72} />
         <directionalLight
-          castShadow
           position={[42, 74, 34]}
           intensity={1.42}
-          shadow-bias={-0.0005}
-          shadow-normalBias={0.02}
-          shadow-mapSize-width={1024}
-          shadow-mapSize-height={1024}
         />
 
         <RoadNetwork
           lanes={sceneSnapshot.lanes}
-          crosswalks={sceneSnapshot.crosswalks}
-          pedestrians={sceneSnapshot.pedestrians}
           signals={sceneSnapshot.signals}
+          directionAxes={sceneSnapshot.direction_axes}
         />
 
-        {sceneSnapshot.vehicles.map((vehicle) => (
-          <VehicleActor key={vehicle.id} id={vehicle.id} laneMap={laneMap} sceneBufferRef={sceneBufferRef} initial={vehicle} />
-        ))}
+        <FrameInterpolationCoordinator sceneBufferRef={sceneBufferRef} resolvedFramesRef={resolvedFramesRef} />
 
-        {sceneSnapshot.pedestrians.map((pedestrian) => (
-          <PedestrianActor key={pedestrian.id} id={pedestrian.id} sceneBufferRef={sceneBufferRef} initial={pedestrian} />
+        {sceneSnapshot.vehicles.map((vehicle) => (
+          <VehicleActor key={vehicle.id} id={vehicle.id} resolvedFramesRef={resolvedFramesRef} initial={vehicle} />
         ))}
 
         <PersistentOrbitController cameraStateRef={cameraStateRef} />

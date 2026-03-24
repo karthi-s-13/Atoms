@@ -6,10 +6,9 @@ Responsibilities:
 
 - one-direction-at-a-time signal control
 - emergency preemption and green extension
-- stop-line enforcement before zebra crossings
-- protected pedestrian all-red phase
-- analytical quarter-circle turning motion
-- free-slip left-turn lanes with merge control
+- stop-line enforcement at each incoming approach
+- analytical straight motion plus shared-lane right turns
+- protected in-intersection left-turn arcs
 - live metrics and event generation
 
 Run validation:

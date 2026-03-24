@@ -3,7 +3,7 @@
 This repository now runs on a clean three-part architecture:
 
 - `simulation_engine/`
-  Pure Python traffic logic. This package owns vehicles, pedestrians, signal phases, emergency preemption, stop lines, zebra crossings, turning paths, and metrics.
+  Pure Python traffic logic. This package owns vehicles, signal phases, emergency preemption, lane geometry, turning paths, and metrics.
 - `realtime_server/`
   FastAPI + WebSocket bridge. This package owns the authoritative 60 FPS clock and streams buffered snapshots to clients.
 - `frontend/`
@@ -43,10 +43,9 @@ shared/
 
 - Runs continuously without returning `None`
 - Allows only one vehicle approach green at a time: `NORTH`, `SOUTH`, `EAST`, or `WEST`
-- Stops vehicles at painted stop lines before zebra crossings
-- Triggers a protected all-red pedestrian phase when crossings are active
+- Stops vehicles cleanly at the approach stop lines
 - Gives siren vehicles directional priority and green extension
-- Moves vehicles on lane paths with smooth turning arcs
+- Moves vehicles on lane paths with smooth straight, right-turn, and left-turn arcs
 - Streams timestamps, positions, velocities, and signal state over WebSocket
 - Renders the 3D scene with buffered interpolation so motion stays smooth and the camera does not reset
 
