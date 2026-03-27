@@ -3,11 +3,11 @@ import { formatTrafficModeLabel, matchTrafficModeId } from "../lib/trafficModes"
 
 const navItems = [
   { to: "/", label: "Home" },
-  { to: "/simulation", label: "Simulation" },
   { to: "/dashboard", label: "Dashboard" },
   { to: "/impact", label: "Impact" },
   { to: "/live-cv", label: "Live CV" },
   { to: "/map", label: "Map" },
+  { to: "/simulation-testing", label: "Testing" },
 ];
 
 function formatSignalMode(value) {

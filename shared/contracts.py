@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, cast
 
 
 SignalState = Literal["GREEN", "GREEN_LEFT", "YELLOW", "RED"]
@@ -61,7 +61,7 @@ DEFAULT_ROUTE_DISTRIBUTION: Dict[str, float] = {
 
 def default_direction_axes() -> Dict[GlobalDirection, DirectionAxisView]:
     return {
-        direction: DirectionAxisView(x=axis.x, z=axis.z)
+        cast(GlobalDirection, direction): DirectionAxisView(x=axis.x, z=axis.z)
         for direction, axis in WORLD_DIRECTION_AXES.items()
     }
 
@@ -183,6 +183,15 @@ class PhaseScoreView:
     green_wave_boost: float = 0.0
     downstream_congestion_penalty: float = 0.0
     arrival_rate: float = 0.0
+    queue: float = 0.0
+    wait_time: float = 0.0
+    arrival_rate_smoothed: float = 0.0
+    flow_rate_smoothed: float = 0.0
+    congestion_component_raw: float = 0.0
+    fairness_boost_raw: float = 0.0
+    emergency_boost_raw: float = 0.0
+    score_raw: float = 0.0
+    demand_active_raw: bool = False
 
 
 @dataclass
@@ -197,13 +206,18 @@ class CongestionAlertView:
 @dataclass
 class EmergencyPriorityView:
     detected: bool = False
+    active: bool = False
     preferred_phase: SignalCycleState | None = None
     approach: Approach | None = None
+    direction: GlobalDirection | None = None
     vehicle_id: str = ""
     eta_seconds: float = 0.0
     vehicle_count: int = 0
     priority_score: float = 0.0
+    priority: str = "LOW"
     state: str = "idle"
+    level: str = "NONE"
+    score: float = 0.0
 
 
 @dataclass
@@ -296,6 +310,7 @@ class SnapshotView:
     phase_timer: float = 0.0
     phase_duration: float = 0.0
     min_green_remaining: float = 0.0
+    pedestrian_phase_active: bool = False
     vehicles: List[VehicleView] = field(default_factory=list)
     lanes: List[LaneView] = field(default_factory=list)
     signals: Dict[str, SignalState] = field(default_factory=dict)
@@ -308,6 +323,8 @@ class SnapshotView:
     network: TrafficNetworkView | None = None
     events: List[EventView] = field(default_factory=list)
     config: SimulationConfig = field(default_factory=SimulationConfig)
+    current_scenario: str = "Normal Flow"
+    demo_timer: float = 0.0
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)

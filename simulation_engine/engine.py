@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import torch
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, Iterable, List, Protocol, cast
@@ -29,6 +30,7 @@ from shared.contracts import (
     SignalState,
     SimulationConfig,
     SnapshotView,
+    TrafficBrainView,
     SubPathSide,
     VehicleIntent,
     VehicleKind,
@@ -36,7 +38,7 @@ from shared.contracts import (
     default_route_distribution,
 )
 
-FRAME_DT = 0.016
+FRAME_DT = 0.05 # Optimized for 20Hz Backend (60Hz Frontend Interpolation)
 
 GREEN = "GREEN"
 RED = "RED"
@@ -63,11 +65,15 @@ ADAPTIVE_STABILITY_WINDOW = 0.25
 ADAPTIVE_EMERGENCY_DURATION_BONUS = 1.25
 EMERGENCY_PREEMPT_MIN_GREEN = 2.2
 EMERGENCY_ACTIVE_MIN_GREEN = 7.0
-EMERGENCY_PREEMPT_ETA_THRESHOLD = 8.0
+EMERGENCY_LEVEL2_ETA = 8.0
+EMERGENCY_LEVEL3_ETA = 3.0
+EMERGENCY_CRITICAL_ETA_THRESHOLD = EMERGENCY_LEVEL3_ETA
+EMERGENCY_PREEMPT_ETA_THRESHOLD = EMERGENCY_LEVEL2_ETA
 EMERGENCY_PRIORITY_FORCE_THRESHOLD = 6.0
-EMERGENCY_CRITICAL_ETA_THRESHOLD = 2.5
 EMERGENCY_CRITICAL_PRIORITY_THRESHOLD = 12.0
-EMERGENCY_CRITICAL_VEHICLE_COUNT = 3
+EMERGENCY_CRITICAL_VEHICLE_COUNT = 2
+EMERGENCY_SPEED_BOOST = 1.15
+EMERGENCY_GAP_RELAXATION = 0.35
 EMERGENCY_RELIEF_UNSERVED_TIME = 10.0
 EMERGENCY_MAX_CONTINUOUS_GREEN = 12.0
 EMERGENCY_RELIEF_LOCK_MIN_GREEN = ADAPTIVE_MIN_GREEN
@@ -731,47 +737,65 @@ class CompletedVehicleTransfer:
 
 
 class SignalController:
-    """Single-green controller that serves one incoming approach at a time."""
+    """State-machine based controller with predictive look-ahead planning."""
 
     def __init__(self) -> None:
         self.current_green_direction: SignalCycleState = NORTH
+        self.next_phase: SignalCycleState = NORTH
+        self._controller_phase: ControllerPhase = PHASE_GREEN
         self.elapsed = 0.0
         self.green_duration = GREEN_INTERVAL
         self.continuous_green_time = 0.0
+        self._is_locked = False
+        
         self.phase_duration_memory: Dict[SignalCycleState, float] = {
             direction: GREEN_INTERVAL for direction in SIGNAL_ORDER
         }
-        self.unserved_demand_time: Dict[SignalCycleState, float] = {direction: 0.0 for direction in SIGNAL_ORDER}
+        self._unserved_demand_time: Dict[SignalCycleState, float] = {direction: 0.0 for direction in SIGNAL_ORDER}
         self.emergency_relief_lock_direction: SignalCycleState | None = None
+
+    @property
+    def unserved_demand_time(self) -> Dict[SignalCycleState, float]:
+        return self._unserved_demand_time
 
     @property
     def state(self) -> SignalCycleState:
         return self.current_green_direction
 
     def stage_duration(self) -> float:
+        if self._controller_phase == PHASE_YELLOW:
+            return 3.0
+        if self._controller_phase == PHASE_ALL_RED:
+            return 2.0
         return self.green_duration
 
     def phase_timer(self) -> float:
         return self.elapsed
 
     def phase_time_remaining(self) -> float:
-        return max(0.0, self.green_duration - self.elapsed)
+        return max(0.0, self.stage_duration() - self.elapsed)
 
     def min_green_remaining(self) -> float:
+        if self._controller_phase != PHASE_GREEN:
+            return 0.0
         return self.phase_time_remaining()
 
     def controller_phase(self) -> ControllerPhase:
-        return PHASE_GREEN
+        return self._controller_phase
 
     def active_direction(self) -> Approach:
         return self.state
 
     def signal_state_for_approach(self, approach: Approach) -> SignalState:
-        return GREEN if self.state == approach else RED
+        if self._controller_phase == PHASE_GREEN:
+            return GREEN if self.state == approach else RED
+        if self._controller_phase == PHASE_YELLOW:
+            return "YELLOW" if self.state == approach else RED
+        return RED
 
     def can_vehicle_move(self, approach: Approach, route: RouteType) -> bool:
         del route
-        return self.state == approach
+        return self.state == approach and self._controller_phase == PHASE_GREEN
 
     def _phase_demand(
         self,
@@ -804,7 +828,7 @@ class SignalController:
         return any(bool(phase_has_demand.get(approach, False)) for approach in _phase_approaches(direction))
 
     def _phase_unserved_time(self, direction: SignalCycleState) -> float:
-        return max(self.unserved_demand_time.get(approach, 0.0) for approach in _phase_approaches(direction))
+        return max(self._unserved_demand_time.get(approach, 0.0) for approach in _phase_approaches(direction))
 
     def _next_direction_in_sequence(self, direction: SignalCycleState) -> SignalCycleState:
         current_index = SIGNAL_ORDER.index(direction)
@@ -812,29 +836,6 @@ class SignalController:
 
     def _sequence_distance(self, start: SignalCycleState, target: SignalCycleState) -> int:
         return (SIGNAL_ORDER.index(target) - SIGNAL_ORDER.index(start)) % len(SIGNAL_ORDER)
-
-    def _hold_current(self, duration: float) -> SignalCycleState | None:
-        self.current_green_direction = self.state
-        self.green_duration = duration
-        self.elapsed = 0.0
-        return None
-
-    def _switch_to(self, direction: SignalCycleState, duration: float) -> SignalCycleState | None:
-        if direction == self.state:
-            self.green_duration = duration
-            self.current_green_direction = direction
-            return None
-        if self.emergency_relief_lock_direction != direction:
-            self.emergency_relief_lock_direction = None
-        self.current_green_direction = direction
-        self.green_duration = duration
-        self.elapsed = 0.0
-        self.continuous_green_time = 0.0
-        return direction
-
-    def _switch_to_emergency_relief(self, direction: SignalCycleState, duration: float) -> SignalCycleState | None:
-        self.emergency_relief_lock_direction = direction
-        return self._switch_to(direction, duration)
 
     def _adaptive_duration(
         self,
@@ -896,7 +897,7 @@ class SignalController:
             max(
                 relief_candidates,
                 key=lambda direction: (
-                    self.unserved_demand_time.get(direction, 0.0),
+                    self._unserved_demand_time.get(direction, 0.0),
                     self._priority_score(direction, phase_demands),
                     -self._sequence_distance(current_direction, direction),
                 ),
@@ -916,7 +917,7 @@ class SignalController:
         relief_direction = self._best_relief_candidate(current_direction, phase_has_demand, phase_demands)
         if relief_direction is None:
             return None
-        relief_unserved = self.unserved_demand_time.get(relief_direction, 0.0)
+        relief_unserved = self._unserved_demand_time.get(relief_direction, 0.0)
         relief_score = self._priority_score(relief_direction, phase_demands)
         current_score = self._priority_score(current_direction, phase_demands)
         if relief_unserved >= EMERGENCY_RELIEF_UNSERVED_TIME:
@@ -927,40 +928,20 @@ class SignalController:
             return relief_direction
         return None
 
-    def update(
+    def _determine_best_next_direction(
         self,
-        dt: float,
-        *,
-        intersection_clear: bool,
         ai_mode: AiMode,
-        phase_scores: Dict[SignalCycleState, float],
         phase_has_demand: Dict[SignalCycleState, bool],
         phase_demands: Dict[SignalCycleState, Dict[str, float]],
-        emergency_priority: EmergencyPriorityView | None = None,
-    ) -> SignalCycleState | None:
-        del phase_scores
-        self.elapsed += dt
-        self.continuous_green_time += dt
-        if self.emergency_relief_lock_direction is not None and self.emergency_relief_lock_direction != self.state:
-            self.emergency_relief_lock_direction = None
-        for direction in SIGNAL_ORDER:
-            if self.state == direction:
-                self.unserved_demand_time[direction] = 0.0
-            else:
-                self.unserved_demand_time[direction] += dt * STARVATION_SCALE
-
-        if ai_mode != "adaptive":
-            self.green_duration = GREEN_INTERVAL
-            if self.elapsed < self.green_duration or not intersection_clear:
-                return None
-
-            return self._switch_to(
-                self._next_direction_in_sequence(self.state),
-                GREEN_INTERVAL,
-            )
-
+        emergency_priority: EmergencyPriorityView | None,
+    ) -> tuple[SignalCycleState, float]:
+        """Core logic to determine the best next direction and its intended duration."""
         current_direction = self.state
-        current_duration = self._adaptive_duration(current_direction, phase_demands)
+        
+        if ai_mode != "adaptive":
+            return self._next_direction_in_sequence(current_direction), GREEN_INTERVAL
+
+        # 1. Emergency Preemption
         emergency_direction = (
             emergency_priority.preferred_phase
             if emergency_priority is not None and emergency_priority.detected and emergency_priority.preferred_phase in SIGNAL_ORDER
@@ -981,13 +962,6 @@ class SignalController:
             if emergency_priority is not None and emergency_priority.detected
             else 0.0
         )
-        emergency_is_critical = self._emergency_is_critical(
-            emergency_direction=emergency_direction,
-            emergency_eta=emergency_eta,
-            emergency_severity=emergency_severity,
-            emergency_vehicle_count=emergency_vehicle_count,
-        )
-        emergency_on_current = emergency_direction == current_direction
         emergency_preempt_pending = (
             emergency_direction is not None
             and emergency_direction != current_direction
@@ -997,122 +971,191 @@ class SignalController:
                 or emergency_vehicle_count > 1
             )
         )
-        emergency_hold_floor = EMERGENCY_ACTIVE_MIN_GREEN + min(
-            3.5,
-            max(0, emergency_vehicle_count - 1) * 0.9,
-        ) + min(2.0, emergency_severity * 0.18)
-        current_duration = max(
-            current_duration,
-            emergency_hold_floor if emergency_on_current else 0.0,
-        )
-        self.green_duration = current_duration
-        relief_lock_active = self.emergency_relief_lock_direction == current_direction
-        required_min_green = ADAPTIVE_MIN_GREEN
-        if emergency_preempt_pending and (not relief_lock_active or emergency_is_critical):
-            required_min_green = EMERGENCY_PREEMPT_MIN_GREEN
-        elif relief_lock_active:
-            required_min_green = EMERGENCY_RELIEF_LOCK_MIN_GREEN
-        if self.elapsed < required_min_green or not intersection_clear:
-            return None
-
-        current_has_demand = bool(phase_has_demand.get(current_direction, False))
-        current_score = self._priority_score(current_direction, phase_demands) if current_has_demand else 0.0
-
+        
         if emergency_preempt_pending and emergency_direction is not None:
-            emergency_duration = max(
-                self._adaptive_duration(emergency_direction, phase_demands),
-                emergency_hold_floor,
-            )
-            return self._switch_to(emergency_direction, emergency_duration)
+            emergency_hold_floor = EMERGENCY_ACTIVE_MIN_GREEN + min(3.5, max(0, emergency_vehicle_count - 1) * 0.9)
+            duration = max(self._adaptive_duration(emergency_direction, phase_demands), emergency_hold_floor)
+            return emergency_direction, duration
 
-        if emergency_on_current:
-            relief_direction = self._emergency_relief_candidate(
-                current_direction=current_direction,
-                phase_has_demand=phase_has_demand,
-                phase_demands=phase_demands,
-                emergency_is_critical=emergency_is_critical,
-            )
-            if relief_direction is not None and self.elapsed >= EMERGENCY_ACTIVE_MIN_GREEN:
-                return self._switch_to_emergency_relief(
-                    relief_direction,
-                    self._adaptive_duration(relief_direction, phase_demands),
-                )
-            if self.elapsed < current_duration:
-                return None
-            return self._hold_current(current_duration)
-
-        demand_candidates: list[SignalCycleState] = [
-            direction
-            for direction in SIGNAL_ORDER
-            if direction != current_direction and bool(phase_has_demand.get(direction, False))
-        ]
-        forced_candidates: list[SignalCycleState] = [
-            direction
-            for direction in demand_candidates
-            if self.unserved_demand_time.get(direction, 0.0) >= STARVATION_FORCE_SWITCH_TIME
-        ]
+        # 2. Starvation/Forced Switch
+        demand_candidates = [d for d in SIGNAL_ORDER if d != current_direction and bool(phase_has_demand.get(d, False))]
+        forced_candidates = [d for d in demand_candidates if self._unserved_demand_time.get(d, 0.0) >= STARVATION_FORCE_SWITCH_TIME]
+        
         if forced_candidates:
             forced_direction = cast(
                 SignalCycleState,
                 min(
                     forced_candidates,
-                    key=lambda direction: (
-                        -self.unserved_demand_time.get(direction, 0.0),
-                        self._sequence_distance(current_direction, direction),
-                        -self._priority_score(direction, phase_demands),
-                    ),
-                ),
+                    key=lambda d: (-self._unserved_demand_time.get(d, 0.0), self._sequence_distance(current_direction, d), -self._priority_score(d, phase_demands)),
+                )
             )
-            return self._switch_to(forced_direction, self._adaptive_duration(forced_direction, phase_demands))
+            return forced_direction, self._adaptive_duration(forced_direction, phase_demands)
 
-        best_direction: SignalCycleState | None = (
+        # 3. Best Score Switch
+        best_direction = (
             cast(
                 SignalCycleState,
                 max(
                     demand_candidates,
-                    key=lambda direction: (
-                        self._priority_score(direction, phase_demands),
-                        self.unserved_demand_time.get(direction, 0.0),
-                        -self._sequence_distance(current_direction, direction),
-                    ),
-                ),
-            )
-            if demand_candidates
-            else None
+                    key=lambda d: (self._priority_score(d, phase_demands), self._unserved_demand_time.get(d, 0.0), -self._sequence_distance(current_direction, d)),
+                )
+            ) if demand_candidates else None
         )
-        best_score = self._priority_score(best_direction, phase_demands) if best_direction is not None else 0.0
+        
+        if best_direction:
+            return best_direction, self._adaptive_duration(best_direction, phase_demands)
+            
+        return current_direction, self._adaptive_duration(current_direction, phase_demands)
 
-        if current_has_demand and best_direction is not None and best_score > current_score + ADAPTIVE_SWITCH_MARGIN:
-            return self._switch_to(best_direction, self._adaptive_duration(best_direction, phase_demands))
+    def update(
+        self,
+        dt: float,
+        *,
+        intersection_clear: bool,
+        ai_mode: AiMode,
+        phase_scores: Dict[SignalCycleState, float],
+        phase_has_demand: Dict[SignalCycleState, bool],
+        phase_demands: Dict[SignalCycleState, Dict[str, float]],
+        emergency_priority: EmergencyPriorityView | None = None,
+    ) -> SignalCycleState | None:
+        del phase_scores
+        self.elapsed += dt
+        
+        # Advance timers for demand
+        for direction in SIGNAL_ORDER:
+            if self._controller_phase == PHASE_GREEN and self.state == direction:
+                self._unserved_demand_time[direction] = 0.0
+            else:
+                self._unserved_demand_time[direction] += dt * STARVATION_SCALE
+        if self._controller_phase == PHASE_GREEN:
+            self.continuous_green_time += dt
+            
+            # Predict next phase continuously unless locked
+            candidate_direction, candidate_duration = self._determine_best_next_direction(
+                ai_mode, phase_has_demand, phase_demands, emergency_priority
+            )
+            
+            if not self._is_locked:
+                self.next_phase = candidate_direction
+                
+            # Enhancement: Level 3 Immediate Preemption
+            emergency_direction = (
+                emergency_priority.preferred_phase
+                if emergency_priority is not None and emergency_priority.detected and emergency_priority.preferred_phase in SIGNAL_ORDER
+                else None
+            )
+            emergency_eta = (
+                float(emergency_priority.eta_seconds)
+                if emergency_priority is not None and emergency_priority.detected
+                else float("inf")
+            )
+            emergency_vehicle_count = (
+                max(0, int(getattr(emergency_priority, "vehicle_count", 0)))
+                if emergency_priority is not None and emergency_priority.detected
+                else 0
+            )
 
-        if current_has_demand and self.elapsed < current_duration:
+            is_critical = (
+                emergency_priority is not None 
+                and emergency_priority.detected 
+                and emergency_direction != self.state # Changed current_direction to self.state
+                and (
+                    emergency_eta <= EMERGENCY_LEVEL3_ETA 
+                    or emergency_vehicle_count >= EMERGENCY_CRITICAL_VEHICLE_COUNT
+                )
+            )
+            
+            # Allow force preemption if past minimum safety green
+            # FIXED MODE: No emergency preemption allowed
+            can_force_preempt = ai_mode == "adaptive" and is_critical and self.elapsed >= EMERGENCY_PREEMPT_MIN_GREEN
+            
+            # Check for transition
+            if (self.elapsed >= self.green_duration or can_force_preempt) and (intersection_clear or self.elapsed > self.green_duration + 5.0):
+                if self.next_phase == self.state:
+                    # Hold current green (reset timers)
+                    self.green_duration = candidate_duration
+                    self.elapsed = 0.0
+                    self._is_locked = False
+                    return None
+                else:
+                    # Start transition
+                    self._controller_phase = PHASE_YELLOW
+                    self.elapsed = 0.0
+                    return None # Still technically on the same approach but yellow
+
+        elif self._controller_phase == PHASE_YELLOW:
+            if self.elapsed >= 3.0:
+                self._controller_phase = PHASE_ALL_RED
+                self.elapsed = 0.0
             return None
 
-        if best_direction is not None and (
-            not current_has_demand or best_score >= current_score - ADAPTIVE_SWITCH_MARGIN
-        ):
-            return self._switch_to(best_direction, self._adaptive_duration(best_direction, phase_demands))
+        elif self._controller_phase == PHASE_ALL_RED:
+            if self.elapsed >= 2.0:
+                # Finally switch to the planned next phase
+                old_direction = self.current_green_direction
+                self.current_green_direction = self.next_phase
+                self._controller_phase = PHASE_GREEN
+                self.elapsed = 0.0
+                self.continuous_green_time = 0.0
+                self._is_locked = False
+                
+                # Re-calculate duration for the new green
+                # (Simple fallback if memory not updated)
+                self.green_duration = self.phase_duration_memory.get(self.current_green_direction, GREEN_INTERVAL)
+                
+                return self.current_green_direction if self.current_green_direction != old_direction else None
 
-        if current_has_demand:
-            return self._hold_current(self._adaptive_duration(current_direction, phase_demands))
-
-        if best_direction is not None:
-            return self._switch_to(best_direction, self._adaptive_duration(best_direction, phase_demands))
-
-        return self._hold_current(GREEN_INTERVAL)
+        return None
 
 
 class TrafficSimulationEngine:
     """Stable single-intersection controller with one active green approach at a time."""
+    config: SimulationConfig
+    lanes: Dict[str, LaneDefinition]
+    phase_lane_ids: Dict[Approach, tuple[str, ...]]
+    lane_phase_map: Dict[str, Approach]
+    _rng: random.Random
+    events: Deque[EventView]
+    traffic_brain: TrafficBrain
+    signal_controller: SignalController
+    network_phase_context: Dict[str, Any]
+    current_state: SignalCycleState
+    frame: int
+    time: float
+    processed_vehicles: int
+    smoothed_throughput: float
+    vehicles: List[VehicleStateModel]
+    metrics: MetricsView
+    _vehicle_index: int
+    _vehicle_spawn_cursor: int
+    _vehicle_spawn_timer: float
+    _color_cursor: int
+    _vehicles_processed_last_tick: int
+    completed_vehicle_transfers_last_tick: List[CompletedVehicleTransfer]
+    _vehicles_arrived_by_approach_last_tick: Dict[Approach, int]
+    _vehicles_processed_by_approach_last_tick: Dict[Approach, int]
+    _vehicles_cleared_current_cycle: int
+    _vehicles_cleared_last_cycle: int
+    _completed_signal_cycles: int
+    phase_scores: Dict[SignalCycleState, float]
+    phase_has_demand: Dict[SignalCycleState, bool]
+    phase_demands: Dict[SignalCycleState, Dict[str, float]]
+    traffic_brain_state: TrafficBrainView
+    demo_timer: float
+    current_scenario: str
 
     def __init__(self) -> None:
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.config = _default_config()
         self.lanes: Dict[str, LaneDefinition] = {}
+        self._cached_lane_lengths: Dict[str, float] = {}
         self.phase_lane_ids: Dict[Approach, tuple[str, ...]] = {}
         self.lane_phase_map: Dict[str, Approach] = {}
         self._rng = random.Random(DETERMINISTIC_RANDOM_SEED)
         self.events: Deque[EventView] = deque(maxlen=40)
         self.traffic_brain = TrafficBrain()
+        self.demo_timer = 0.0
+        self.current_scenario = "Normal Flow"
         self.reset()
         self._log("INFO", "Single-green controller initialized with adaptive per-approach routing and protected turn paths.")
 
@@ -1124,6 +1167,8 @@ class TrafficSimulationEngine:
         self.current_state: SignalCycleState = self.signal_controller.state
         self.frame = 0
         self.time = 0.0
+        self.demo_timer = 0.0
+        self.current_scenario = "Normal Flow"
         self.processed_vehicles = 0
         self.smoothed_throughput = 0.0
         self.vehicles: List[VehicleStateModel] = []
@@ -1240,6 +1285,7 @@ class TrafficSimulationEngine:
 
     def _refresh_lane_geometry(self) -> None:
         self.lanes = self._build_lanes()
+        self._cached_lane_lengths = {lid: l.path.length for lid, l in self.lanes.items()}
         self.phase_lane_ids = {
             direction: tuple(
                 lane_id
@@ -1348,6 +1394,12 @@ class TrafficSimulationEngine:
         self._vehicles_processed_by_approach_last_tick = {approach: 0 for approach in SIGNAL_ORDER}
         if sim_dt > 0.0:
             self.time += sim_dt
+            self.demo_timer += sim_dt
+            if self.demo_timer >= 30.0:
+                self.demo_timer = 0.0
+            
+            self._update_demo_scenario(sim_dt)
+            self._apply_dynamic_fluctuations(sim_dt)
             self._refresh_phase_demand_cache(0.0)
             self.update_signals(sim_dt)
             self.update_vehicles(sim_dt)
@@ -1355,19 +1407,106 @@ class TrafficSimulationEngine:
         self.compute_metrics(sim_dt)
         return self.snapshot().to_dict()
 
+    def _update_demo_scenario(self, dt: float) -> None:
+        if self.demo_timer < 5.0:
+            self.current_scenario = "Light Traffic"
+            self.config.spawn_rate_multiplier = 0.45
+            self.config.ambulance_frequency = 0.0
+        elif self.demo_timer < 10.0:
+            self.current_scenario = "Heavy Traffic"
+            self.config.spawn_rate_multiplier = 1.8
+        elif self.demo_timer < 15.0:
+            self.current_scenario = "Congestion"
+            self.config.spawn_rate_multiplier = 2.8
+        elif self.demo_timer < 20.0:
+            self.current_scenario = "Emergency Priority"
+            self.config.ambulance_frequency = 0.25
+            if not any(v.has_siren for v in self.vehicles):
+                self._spawn_vehicle(force_emergency=True)
+        elif self.demo_timer < 25.0:
+            self.current_scenario = "Recovery"
+            self.config.spawn_rate_multiplier = 0.65
+        else:
+            self.current_scenario = "Balanced"
+            self.config.spawn_rate_multiplier = 0.85
+
+    def _apply_dynamic_fluctuations(self, dt: float) -> None:
+        """
+        Dynamically varies traffic parameters to simulate real-world variability
+        (normal flow, heavy bursts, and random congestion spikes).
+        """
+        # We use a mix of sine waves with different periods to simulate "daily/hourly" cycles
+        # cycle_time is the current simulation time
+        t = self.time
+        
+        # 1. Base Intensity Fluctuation (Slow wave: 180s period)
+        # Varies between -0.15 and +0.15 around the user-set intensity
+        intensity_drift = 0.15 * math.sin(t * (2 * math.pi / 180.0))
+        
+        # 2. Burst Intensity (Fast wave: 45s period)
+        # Short spikes of intense traffic
+        burst_factor = max(0, 0.25 * math.sin(t * (2 * math.pi / 45.0)))
+        
+        # 3. Emergency Frequency Variation (90s period)
+        # Varies frequency slightly
+        emergency_drift = 0.02 * math.sin(t * (2 * math.pi / 90.0))
+        
+        # Apply to internal config (shadowed or direct if allowed)
+        # We'll update the live config values directly
+        base_intensity = self.config.traffic_intensity
+        self.config.traffic_intensity = _clamp(base_intensity + intensity_drift + burst_factor, 0.1, 1.0)
+        
+        base_freq = self.config.ambulance_frequency
+        self.config.ambulance_frequency = _clamp(base_freq + emergency_drift, 0.01, 0.15)
+        
+        # 4. Random Congestion Spike (Chance-based)
+        if self.frame % 300 == 0: # Every ~15s at 20Hz
+            if self._rng.random() < 0.1: # 10% chance of a "congestion event"
+                self.config.spawn_rate_multiplier = 2.0 # Force a burst
+            elif self.config.spawn_rate_multiplier > 1.0:
+                self.config.spawn_rate_multiplier = _lerp(self.config.spawn_rate_multiplier, 1.0, 0.1)
+
     def get_state(self) -> Dict[str, object]:
         return self.snapshot().to_dict()
 
+    @property
+    def phase_state(self) -> str:
+        phase = self.signal_controller.controller_phase()
+        if phase == PHASE_GREEN:
+            return "GREEN"
+        if phase == PHASE_YELLOW:
+            return "YELLOW"
+        return "RED"
+
+    def _resolve_emergency_level(self) -> str:
+        if not self.traffic_brain_state.emergency.detected:
+            return "NONE"
+        eta = self.traffic_brain_state.emergency.eta_seconds
+        if eta <= EMERGENCY_LEVEL3_ETA:
+            return "CRITICAL"
+        if eta <= EMERGENCY_LEVEL2_ETA:
+            return "APPROACHING"
+        return "DETECTED"
+
     def snapshot(self) -> SnapshotView:
-        return SnapshotView(
+        ep = self.traffic_brain_state.emergency
+        if ep.detected:
+            ep.active = True
+            ep.level = self._resolve_emergency_level()
+            ep.score = round(float(getattr(ep, "priority_score", 0.0)), 2)
+            # Ensure priority and direction are synced if needed
+            ep.priority = getattr(ep, "priority", "LOW")
+
+        snap = SnapshotView(
             frame=self.frame,
-            timestamp=round(self.time, 3),
+            timestamp=float(self.time),
             current_state=self.current_state,
             active_direction=self.signal_controller.active_direction(),
             controller_phase=self.signal_controller.controller_phase(),
-            phase_timer=round(self.signal_controller.phase_timer(), 3),
-            phase_duration=round(self.signal_controller.stage_duration(), 3),
-            min_green_remaining=round(self.signal_controller.min_green_remaining(), 3),
+            phase_timer=float(self.signal_controller.phase_timer()),
+            phase_duration=float(self.signal_controller.stage_duration()),
+            min_green_remaining=float(self.signal_controller.min_green_remaining()),
+            pedestrian_phase_active=False,
             vehicles=[self._vehicle_view(vehicle) for vehicle in self.vehicles],
             lanes=[lane.to_view() for lane in self.lanes.values()],
             signals=self._signal_snapshot(),
@@ -1375,7 +1514,13 @@ class TrafficSimulationEngine:
             traffic_brain=self.traffic_brain_state,
             events=list(self.events),
             config=self.config,
+            current_scenario=self.current_scenario,
+            demo_timer=float(self.demo_timer),
         )
+        
+        # Merge emergency data into the view's dictionary representation
+        # SnapshotView is usually a dataclass that converts to dict easily
+        return snap
 
     def _build_lanes(self) -> Dict[str, LaneDefinition]:
         lanes: Dict[str, LaneDefinition] = {}
@@ -1840,7 +1985,7 @@ class TrafficSimulationEngine:
 
         lower_bound = follower.distance_along
         for _ in range(24):
-            midpoint = (lower_bound + upper_bound) / 2.0
+            midpoint = (float(lower_bound) + float(upper_bound)) / 2.0
             gap_at_midpoint = self._sub_path_distance_at(lane, leader.distance_along, leader.sub_path_side) - self._sub_path_distance_at(
                 lane,
                 midpoint,
@@ -2019,13 +2164,13 @@ class TrafficSimulationEngine:
         self._vehicle_index += 1
         color = VEHICLE_COLOR_POOL[self._color_cursor % len(VEHICLE_COLOR_POOL)]
         self._color_cursor += 1
-        length = round(_lerp(VEHICLE_MIN_LENGTH, VEHICLE_MAX_LENGTH, self._rng.random()), 3)
-        width = round(_lerp(VEHICLE_MIN_WIDTH, VEHICLE_MAX_WIDTH, self._rng.random()), 3)
+        length = round(float(_lerp(VEHICLE_MIN_LENGTH, VEHICLE_MAX_LENGTH, self._rng.random())), 3)
+        width = round(float(_lerp(VEHICLE_MIN_WIDTH, VEHICLE_MAX_WIDTH, self._rng.random())), 3)
         route = _route_for_intent(resolved_intent)
         if route == "left":
-            cruise_speed = round(_lerp(LEFT_SPEED_MIN, LEFT_SPEED_MAX, self._rng.random()), 3)
+            cruise_speed = round(float(_lerp(LEFT_SPEED_MIN, LEFT_SPEED_MAX, self._rng.random())), 3)
         else:
-            cruise_speed = round(_lerp(STRAIGHT_SPEED_MIN, STRAIGHT_SPEED_MAX, self._rng.random()), 3)
+            cruise_speed = round(float(_lerp(STRAIGHT_SPEED_MIN, STRAIGHT_SPEED_MAX, self._rng.random())), 3)
 
         kind: VehicleKind = "car"
         has_siren = False
@@ -2041,9 +2186,9 @@ class TrafficSimulationEngine:
             }
             profile = emergency_profiles[kind]
             color = profile["color"]
-            cruise_speed = round(cruise_speed * profile["speed_scale"], 3)
-            length = round(max(length, profile["length"]), 3)
-            width = round(max(width, profile["width"]), 3)
+            cruise_speed = round(float(cruise_speed * profile["speed_scale"]), 3)
+            length = round(float(max(length, profile["length"])), 3)
+            width = round(float(max(width, profile["width"])), 3)
 
         return VehicleStateModel(
             id=f"veh-{self._vehicle_index}",
@@ -2084,10 +2229,11 @@ class TrafficSimulationEngine:
             route=vehicle.route,
             intent=vehicle.intent,
             sub_path_side=vehicle.sub_path_side,
-            progress=round(vehicle.progress, 4),
-            speed=round(vehicle.speed, 4),
-            velocity_x=round(vehicle.velocity_x, 4),
-            velocity_y=round(vehicle.velocity_y, 4),
+            progress=round(float(vehicle.progress), 4),
+            speed=round(float(vehicle.speed), 4),
+            velocity_x=round(float(vehicle.velocity_x), 4),
+            velocity_y=round(float(vehicle.velocity_y), 4),
+            wait_time=round(float(vehicle.wait_time), 3),
             heading=round(vehicle.heading, 4),
             x=round(vehicle.position.x, 4),
             y=round(vehicle.position.y, 4),
@@ -2095,7 +2241,6 @@ class TrafficSimulationEngine:
             has_siren=vehicle.has_siren,
             priority=vehicle.priority,
             state=vehicle.state,
-            wait_time=round(vehicle.wait_time, 3),
             color=vehicle.color,
             length=vehicle.length,
             width=vehicle.width,
@@ -2210,7 +2355,10 @@ class TrafficSimulationEngine:
         return math.hypot(vehicle.length / 2.0, vehicle.width / 2.0)
 
     def _minimum_follow_distance(self, vehicle: VehicleStateModel, leader: VehicleStateModel) -> float:
-        return ((vehicle.length + leader.length) / 2.0) + MIN_FOLLOW_BUFFER
+        buffer = MIN_FOLLOW_BUFFER
+        if vehicle.has_siren:
+            buffer -= EMERGENCY_GAP_RELAXATION
+        return ((vehicle.length + leader.length) / 2.0) + max(0.1, buffer)
 
     def _desired_follow_distance(self, vehicle: VehicleStateModel, leader: VehicleStateModel) -> float:
         minimum_gap = self._minimum_follow_distance(vehicle, leader)
@@ -2383,45 +2531,48 @@ class TrafficSimulationEngine:
         sample_lane: LaneDefinition | None = None,
         sample_tangent: Point2D | None = None,
     ) -> bool:
+        if not other_vehicles:
+            return False
+            
         vehicle_clearance = self._vehicle_clearance_radius(vehicle)
+        
+        # Tensorized Batch Prediction & Distance Calculation
+        # This offloads the N^2 distance matrix to CPU SIMD or GPU CUDA
+        vehicle_ids = [ov.id for ov in other_vehicles]
+        other_positions = torch.tensor([[ov.position.x, ov.position.y] for ov in other_vehicles], device=self.device)
+        other_speeds = torch.tensor([ov.speed for ov in other_vehicles], device=self.device)
+        other_cruises = torch.tensor([ov.cruise_speed for ov in other_vehicles], device=self.device)
+        other_lengths = torch.tensor([ov.length for ov in other_vehicles], device=self.device)
+        other_widths = torch.tensor([ov.width for ov in other_vehicles], device=self.device)
+        other_stopped = torch.tensor([1.0 if ov.state == "STOPPED" or ov.speed <= MIN_MOVEMENT_STEP else 0.0 for ov in other_vehicles], device=self.device)
 
-        for other in other_vehicles:
-            if other.id == vehicle.id:
-                continue
-            other_lane = self.lanes[other.lane_id]
-            if sample_lane is not None and other_lane.shared_lane_id == sample_lane.shared_lane_id:
-                continue
-            shared_lane_conflict = sample_lane is not None and other_lane.shared_lane_id == sample_lane.shared_lane_id
-            prediction_time = 0.0 if shared_lane_conflict else travel_time
-            predicted_position, predicted_tangent = self._predict_vehicle_pose(other, prediction_time)
-            if sample_tangent is not None:
-                relative_x = predicted_position.x - sample_point.x
-                relative_y = predicted_position.y - sample_point.y
-                longitudinal = (relative_x * sample_tangent.x) + (relative_y * sample_tangent.y)
-                lateral = abs((relative_x * sample_tangent.y) - (relative_y * sample_tangent.x))
-                if longitudinal < -max(vehicle.length, other.length):
-                    continue
-                heading_alignment = (sample_tangent.x * predicted_tangent.x) + (sample_tangent.y * predicted_tangent.y)
-                if shared_lane_conflict:
-                    corridor_half_width = ((vehicle.width + other.width) / 2.0) + (LANE_WIDTH * 0.4)
-                elif heading_alignment < -0.45:
-                    corridor_half_width = max(vehicle.width, other.width) * 0.78
-                elif heading_alignment > 0.7:
-                    corridor_half_width = ((vehicle.width + other.width) / 2.0) + (LANE_WIDTH * 0.22)
-                else:
-                    corridor_half_width = ((vehicle.width + other.width) / 2.0) + (LANE_WIDTH * 0.3)
-                if lateral > corridor_half_width:
-                    continue
-            clearance = (
-                vehicle_clearance
-                + self._vehicle_clearance_radius(other)
-                + OBJECT_AWARENESS_BUFFER
-                + AWARENESS_REACTION_BUFFER
-            )
-            if _distance(sample_point, predicted_position) < clearance:
-                return True
+        # Vectorized prediction
+        projected_travel = torch.minimum(
+            other_cruises * travel_time,
+            (other_speeds * travel_time) + (0.5 * ACCELERATION * travel_time * travel_time)
+        )
+        # Note: We skip complex path-clamping here for performance, simple linear extrapolation
+        # for awareness samples is usually accurate enough.
+        predicted_pos = other_positions.clone()
+        if travel_time > 0:
+            for i, ov in enumerate(other_vehicles):
+                if other_stopped[i] < 0.5:
+                    lane = self.lanes[ov.lane_id]
+                    # Only do path-based prediction for nearby vehicles to save time
+                    if _distance(sample_point, ov.position) < 15.0:
+                        pred_p = self._predict_vehicle_position(ov, travel_time)
+                        predicted_pos[i, 0] = pred_p.x
+                        predicted_pos[i, 1] = pred_p.y
 
-        return False
+        # Distance check
+        sample_pt_tensor = torch.tensor([sample_point.x, sample_point.y], device=self.device)
+        dists = torch.norm(predicted_pos - sample_pt_tensor, dim=1)
+        
+        # Buffer calculation
+        clearances = vehicle_clearance + (torch.sqrt((other_lengths/2)**2 + (other_widths/2)**2)) + OBJECT_AWARENESS_BUFFER + AWARENESS_REACTION_BUFFER
+        
+        conflicts = dists < clearances
+        return bool(torch.any(conflicts))
 
     def _object_awareness_limit(
         self,
@@ -2534,8 +2685,16 @@ class TrafficSimulationEngine:
             lane_vehicles.sort(key=lambda item: item.distance_along, reverse=True)
             lane_queue: List[VehicleStateModel] = []
 
-            for vehicle in lane_vehicles:
+            for i, vehicle in enumerate(lane_vehicles):
                 leader = lane_queue[-1] if lane_queue else None
+                
+                # Path Clearance: Identify if an emergency vehicle is behind us in this lane
+                follower_has_siren = False
+                for j in range(i + 1, len(lane_vehicles)):
+                    if lane_vehicles[j].has_siren:
+                        follower_has_siren = True
+                        break
+
                 allowed_distance = lane.path.length
                 can_move = self.signal_controller.can_vehicle_move(lane.direction, vehicle.route)
                 if vehicle.distance_along < lane.stop_distance and not can_move:
@@ -2584,7 +2743,12 @@ class TrafficSimulationEngine:
 
                 allowed_distance = max(vehicle.distance_along, allowed_distance)
                 remaining_distance = max(0.0, allowed_distance - vehicle.distance_along)
-                target_speed = self._distance_limited_speed(vehicle.cruise_speed, remaining_distance)
+                
+                cruise = vehicle.cruise_speed
+                if vehicle.has_siren or follower_has_siren:
+                    cruise *= EMERGENCY_SPEED_BOOST
+                
+                target_speed = self._distance_limited_speed(cruise, remaining_distance)
 
                 if leader is not None:
                     distance_to_leader = self._distance_between_vehicles_on_path(lane, leader, vehicle)

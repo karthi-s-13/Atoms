@@ -151,6 +151,15 @@ export interface PhaseScoreView {
   green_wave_boost: number;
   downstream_congestion_penalty: number;
   arrival_rate: number;
+  queue: number;
+  wait_time: number;
+  arrival_rate_smoothed: number;
+  flow_rate_smoothed: number;
+  congestion_component_raw: number;
+  fairness_boost_raw: number;
+  emergency_boost_raw: number;
+  score_raw: number;
+  demand_active_raw: boolean;
 }
 
 export interface CongestionAlertView {
@@ -260,4 +269,6 @@ export interface SnapshotView {
   network: TrafficNetworkView | null;
   events: EventView[];
   config: SimulationConfig;
+  current_scenario: string;
+  demo_timer: number;
 }

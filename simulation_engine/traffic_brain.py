@@ -23,8 +23,17 @@ EMERGENCY_KINDS: tuple[VehicleKind, ...] = ("ambulance", "firetruck", "police")
 QUEUE_SCORE_WEIGHT = 1.0
 WAIT_SCORE_WEIGHT = 1.5
 ARRIVAL_SCORE_WEIGHT = 1.2
-LANE_WEIGHT_SCORE_WEIGHT = 0.85
-TREND_SCORE_WEIGHT = 0.55
+FAIRNESS_BOOST_WEIGHT = 1.5
+QUEUE_SCORE_WEIGHT = 1.0
+PREDICTIVE_LOAD_WEIGHT = 0.85
+PREDICTION_HORIZON = 10.0
+EMERGENCY_BOOST_WEIGHT = 3.5
+EMERGENCY_PRIORITY_WEIGHTS: Dict[VehicleKind, float] = {
+    "ambulance": 3.4,
+    "firetruck": 3.0,
+    "police": 2.5,
+}
+
 EMERGENCY_BASE_BOOST = 1.8
 EMERGENCY_COUNT_SCORE_WEIGHT = 1.2
 EMERGENCY_PRIORITY_SCORE_WEIGHT = 1.45
@@ -34,12 +43,19 @@ EMERGENCY_WAIT_SCORE_WEIGHT = 0.72
 EMERGENCY_WAIT_SCORE_CAP = 8.0
 EMERGENCY_BLOCKING_SCORE_WEIGHT = 1.15
 EMERGENCY_BLOCKING_SCORE_CAP = 5.0
-STARVATION_GRACE_PERIOD = 8.0
+
+# Starvation Prevention (Production Specs)
+STARVATION_THRESHOLD = 18.0
+STARVATION_BOOST_THRESHOLD = 8.0
 STARVATION_BOOST_PER_SECOND = 0.6
 STARVATION_BOOST_CAP = 12.0
-FAIR_WAIT_THRESHOLD = 5.0
-FAIR_WAIT_BOOST_PER_SECOND = 0.42
-FAIR_WAIT_BOOST_CAP = 6.0
+
+# Adaptive Green Time
+MIN_GREEN = 5.0
+MAX_GREEN = 25.0
+BASE_GREEN = 5.0
+QUEUE_GROWTH_FACTOR = 1.7
+DURATION_SMOOTHING = 0.6
 CONGESTION_QUEUE_MEDIUM = 3.0
 CONGESTION_QUEUE_HIGH = 5.0
 CONGESTION_WAIT_HIGH = 4.0
@@ -107,14 +123,16 @@ class TrafficBrain:
     """Compute simple queue and flow telemetry without controlling the signals."""
 
     def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
         self.previous_direction_queues: Dict[Approach, float] = {approach: 0.0 for approach in APPROACH_ORDER}
         self.smoothed_queue_lengths: Dict[Approach, float] = {approach: 0.0 for approach in APPROACH_ORDER}
         self.smoothed_wait_times: Dict[Approach, float] = {approach: 0.0 for approach in APPROACH_ORDER}
         self.smoothed_arrival_rates: Dict[Approach, float] = {approach: 0.0 for approach in APPROACH_ORDER}
         self.smoothed_flow_rates: Dict[Approach, float] = {approach: 0.0 for approach in APPROACH_ORDER}
+        self.emergency_suppression_time: Dict[Approach, float] = {approach: 0.0 for approach in APPROACH_ORDER}
+        self.last_emergency_active: bool = False
+
+    def reset(self) -> None:
+        self.__init__()
 
     def evaluate(
         self,
@@ -181,6 +199,13 @@ class TrafficBrain:
         emergency = self._closest_emergency(vehicles, lane_phase_map, current_phase)
         phase_priority: Dict[SignalCycleState, float] = {direction: 0.0 for direction in APPROACH_ORDER}
 
+        # Update suppression times for other lanes if an emergency is active somewhere else
+        any_emergency = any(emergency_counts.values())
+        if any_emergency:
+            for apr in APPROACH_ORDER:
+                if emergency_counts[apr] == 0:
+                    self.emergency_suppression_time[apr] += dt
+
         for approach in APPROACH_ORDER:
             current_queue = queue_counts[approach]
             previous_queue = self.previous_direction_queues.get(approach, current_queue)
@@ -209,16 +234,7 @@ class TrafficBrain:
                 else _lerp(self.smoothed_flow_rates[approach], instant_flow, SERVICE_SMOOTHING)
             )
             lane_ids = phase_lane_ids.get(approach, ())
-            lane_count = max(1, len(lane_ids))
-            lane_queue_load = sum(lane_queue_counts.get(lane_id, 0.0) for lane_id in lane_ids) / lane_count
-            peak_lane_queue = max((lane_queue_counts.get(lane_id, 0.0) for lane_id in lane_ids), default=0.0)
-            lane_vehicle_load = sum(lane_vehicle_counts.get(lane_id, 0.0) for lane_id in lane_ids) / lane_count
-            trend = _clamp(queue_delta * TREND_SCORE_WEIGHT, -1.25, 2.75)
-            queue_component = smoothed_queue * QUEUE_SCORE_WEIGHT
-            wait_component = min(smoothed_wait, 14.0) * WAIT_SCORE_WEIGHT
-            arrival_component = arrival_rate * ARRIVAL_SCORE_WEIGHT
-            lane_weight_component = ((peak_lane_queue * 0.85) + (lane_queue_load * 0.55) + (lane_vehicle_load * 0.3)) * LANE_WEIGHT_SCORE_WEIGHT
-            starvation_time = max(0.0, float(unserved_demand_time.get(approach, 0.0)) - STARVATION_GRACE_PERIOD)
+            starvation_time = max(0.0, float(unserved_demand_time.get(approach, 0.0)) - STARVATION_BOOST_THRESHOLD)
             demand_active = bool(
                 current_queue > 0.0
                 or arrival_rate > 0.05
@@ -226,25 +242,52 @@ class TrafficBrain:
                 or any(vehicle.approach == approach for vehicle in vehicles)
             )
             starvation_boost = min(starvation_time * STARVATION_BOOST_PER_SECOND, STARVATION_BOOST_CAP) if demand_active else 0.0
-            long_wait_boost = (
-                min(max(0.0, max_wait_times[approach] - FAIR_WAIT_THRESHOLD) * FAIR_WAIT_BOOST_PER_SECOND, FAIR_WAIT_BOOST_CAP)
-                if demand_active
-                else 0.0
-            )
-            fairness_boost = starvation_boost + long_wait_boost
-            emergency_count_boost = emergency_counts[approach] * EMERGENCY_COUNT_SCORE_WEIGHT
-            emergency_priority_boost = emergency_priority_totals[approach] * EMERGENCY_PRIORITY_SCORE_WEIGHT
-            emergency_proximity_boost = 0.0
+            
+            # Implementation of FairnessBoost
+            fairness_boost = starvation_boost * FAIRNESS_BOOST_WEIGHT
+            
+            # Enhancement: Post-Emergency Fairness Compensation
+            if emergency_counts[approach] > 0:
+                self.emergency_suppression_time = {k: 0.0 for k in APPROACH_ORDER}
+                self.last_emergency_active = True
+            elif self.last_emergency_active and any(emergency_counts.values()) == 0:
+                # Emergency just passed
+                self.last_emergency_active = False
+
+            # Fairness Boost (Enhanced with Starvation + Emergency Compensation)
+            emergency_compensation = self.emergency_suppression_time[approach] * 0.45
+            fairness_boost = (starvation_boost + emergency_compensation) * FAIRNESS_BOOST_WEIGHT
+            
+            # Implementation of Enhanced EmergencyBoost
+            # EmergencyBoost = weight * (1 / max(ETA, 0.1)) * proximity_factor
+            emergency_boost = 0.0
             if emergency_counts[approach] > 0 and nearest_emergency_eta[approach] < float("inf"):
-                proximity_ratio = max(0.0, EMERGENCY_PROXIMITY_HORIZON - nearest_emergency_eta[approach]) / EMERGENCY_PROXIMITY_HORIZON
-                emergency_proximity_boost = proximity_ratio * EMERGENCY_PROXIMITY_SCORE_WEIGHT
-            emergency_boost = (
-                (EMERGENCY_BASE_BOOST if emergency_counts[approach] > 0 else 0.0)
-                + emergency_count_boost
-                + emergency_priority_boost
-                + emergency_proximity_boost
+                vehicle_kind = "ambulance" # Default as backup
+                for v in vehicles:
+                    if v.approach == approach and v.kind in EMERGENCY_PRIORITY_WEIGHTS:
+                        vehicle_kind = v.kind
+                        break
+                
+                weight = EMERGENCY_PRIORITY_WEIGHTS.get(vehicle_kind, 2.5)
+                eta = max(nearest_emergency_eta[approach], 0.1)
+                proximity_factor = max(1.0, 1.25 * (EMERGENCY_PROXIMITY_HORIZON / (eta + 1.0)))
+                
+                emergency_boost = weight * (1.0 / eta) * proximity_factor
+            
+            # Decision Scoring Loop
+            # Score = (Queue * 1.0) + (WaitTime * 1.5) + (ArrivalRate * 1.2) + (PredictiveLoad * 0.85) + (FairnessBoost * 1.5) + (EmergencyBoost * 3.5)
+            # PredictiveLoad = queue + (arrival_rate * 10)
+            
+            predictive_load = smoothed_queue + (arrival_rate * PREDICTION_HORIZON)
+            
+            score = (
+                (smoothed_queue * QUEUE_SCORE_WEIGHT)
+                + (smoothed_wait * WAIT_SCORE_WEIGHT)
+                + (arrival_rate * ARRIVAL_SCORE_WEIGHT)
+                + (predictive_load * PREDICTIVE_LOAD_WEIGHT)
+                + fairness_boost
+                + (emergency_boost * EMERGENCY_BOOST_WEIGHT)
             )
-            score = queue_component + wait_component + arrival_component + lane_weight_component + fairness_boost + emergency_boost
 
             alert_level = "normal"
             if current_queue >= CONGESTION_QUEUE_HIGH or avg_wait >= CONGESTION_WAIT_HIGH:
@@ -261,35 +304,35 @@ class TrafficBrain:
                             if ai_mode == "adaptive"
                             else f"{approach.title()} queue is building up under the fixed single-green cycle."
                         ),
-                        queue_length=round(current_queue, 3),
-                        queue_delta=round(queue_delta, 3),
+                        queue_length=float(current_queue),
+                        queue_delta=float(queue_delta),
                     )
                 )
 
             direction_metrics[approach] = DirectionMetricView(
                 approach=approach,
-                queue_length=round(current_queue, 3),
-                avg_wait_time=round(avg_wait, 3),
-                flow_rate=round(flow_rate, 3),
-                queue_delta=round(queue_delta, 3),
-                congestion_trend=round(trend, 3),
+                queue_length=float(current_queue),
+                avg_wait_time=float(avg_wait),
+                flow_rate=float(flow_rate),
+                queue_delta=float(queue_delta),
+                congestion_trend=0.0,
                 emergency_vehicles=emergency_counts[approach],
                 alert_level=alert_level,
-                arrival_rate=round(arrival_rate, 3),
+                arrival_rate=float(arrival_rate),
             )
             phase_scores[approach] = PhaseScoreView(
                 phase=approach,
-                score=round(score, 3),
-                queue_component=round(queue_component, 3),
-                wait_time_component=round(wait_component, 3),
-                congestion_component=round(trend, 3),
-                flow_component=round(arrival_component, 3),
-                lane_weight_component=round(lane_weight_component, 3),
-                fairness_boost=round(fairness_boost, 3),
-                emergency_boost=round(emergency_boost, 3),
-                queue_length=round(smoothed_queue, 3),
-                avg_wait_time=round(smoothed_wait, 3),
-                flow_rate=round(flow_rate, 3),
+                score=float(score),
+                queue_component=float(smoothed_queue * QUEUE_SCORE_WEIGHT),
+                wait_time_component=float(smoothed_wait * WAIT_SCORE_WEIGHT),
+                congestion_component=float(predictive_load * PREDICTIVE_LOAD_WEIGHT),
+                flow_component=float(arrival_rate * ARRIVAL_SCORE_WEIGHT),
+                lane_weight_component=0.0,
+                fairness_boost=float(fairness_boost),
+                emergency_boost=float(emergency_boost * EMERGENCY_BOOST_WEIGHT),
+                queue_length=float(smoothed_queue),
+                avg_wait_time=float(smoothed_wait),
+                flow_rate=float(flow_rate),
                 demand_active=demand_active,
                 recommended_hold=_phase_serves_approach(current_phase, approach),
                 decision_reason=self._decision_reason(
@@ -301,7 +344,16 @@ class TrafficBrain:
                     arrival_rate,
                     fairness_boost,
                 ),
-                arrival_rate=round(arrival_rate, 3),
+                arrival_rate=round(float(arrival_rate), 3),
+                queue=round(float(self.smoothed_queue_lengths[approach]), 3),
+                wait_time=round(float(self.smoothed_wait_times[approach]), 3),
+                arrival_rate_smoothed=round(float(self.smoothed_arrival_rates[approach]), 3),
+                flow_rate_smoothed=round(float(self.smoothed_flow_rates[approach]), 3),
+                congestion_component_raw=round(float(predictive_load * PREDICTIVE_LOAD_WEIGHT), 3), # Assuming congestion_trend was predictive_load * PREDICTIVE_LOAD_WEIGHT
+                fairness_boost_raw=round(float(fairness_boost), 3),
+                emergency_boost_raw=round(float(emergency_boost), 3),
+                score_raw=round(float(score), 3),
+                demand_active_raw=bool(demand_active),
             )
 
             self.previous_direction_queues[approach] = current_queue
@@ -318,7 +370,7 @@ class TrafficBrain:
         )
         active_phase_score = phase_priority[current_phase]
         return TrafficBrainView(
-            active_phase_score=round(active_phase_score, 3),
+            active_phase_score=round(float(active_phase_score), 3),
             top_phase=top_phase,
             strategy=self._strategy_text(current_phase, controller_phase, ai_mode),
             direction_metrics=direction_metrics,
@@ -391,15 +443,17 @@ class TrafficBrain:
         if best_vehicle is None or best_phase is None:
             return EmergencyPriorityView()
 
+        assert best_vehicle is not None
+        assert best_phase is not None
         state = "serving" if current_phase == best_phase else "tracking"
         return EmergencyPriorityView(
             detected=True,
             preferred_phase=best_phase,
             approach=best_vehicle.approach,
             vehicle_id=best_vehicle.id,
-            eta_seconds=round(best_eta, 3),
-            vehicle_count=phase_counts[best_phase],
-            priority_score=round(phase_priority_scores[best_phase], 3),
+            eta_seconds=float(best_eta),
+            vehicle_count=int(phase_counts[best_phase]),
+            priority_score=float(phase_priority_scores[best_phase]),
             state=state,
         )
 

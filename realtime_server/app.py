@@ -32,7 +32,9 @@ except Exception:
 
 from realtime_server.emergency_routing import GoogleEmergencyRouter, decode_polyline_points
 from realtime_server.traffic_platform import MapStreamHub, TrafficPlatformService
+from hardware import SignalController
 from simulation_engine import FRAME_DT, TrafficNetwork
+from vision_module.detector import AmbulanceDetector
 
 JUNCTION_REGISTRY_PATH = Path(__file__).resolve().parent / "junction_registry.json"
 AMBULANCE_CLASSIFIER_PATH = PROJECT_ROOT / "models" / "ambulance_yolo_cls.pt"
@@ -86,44 +88,7 @@ MAP_ROUTE_MAX_LOCK_SECONDS = 90.0
 DEFAULT_GREEN_WAVE_SPEED_KMPH = 32.0
 
 
-class AmbulanceYoloClassifier:
-    """Optional YOLO classifier for ambulance-vs-nonambulance crops."""
 
-    def __init__(self) -> None:
-        self._model: YOLO | None = None
-        self._lock = asyncio.Lock()
-
-    async def predict(self, crop: np.ndarray) -> tuple[bool, float]:
-        model = await self._get_model()
-        return self._predict_with_model(model, crop)
-
-    async def _get_model(self) -> YOLO | None:
-        if self._model is not None:
-            return self._model
-        if not AMBULANCE_CLASSIFIER_PATH.exists():
-            return None
-
-        async with self._lock:
-            if self._model is None and AMBULANCE_CLASSIFIER_PATH.exists():
-                self._model = await asyncio.to_thread(YOLO, str(AMBULANCE_CLASSIFIER_PATH))
-        return self._model
-
-    def predict_sync(self, crop: np.ndarray) -> tuple[bool, float]:
-        return self._predict_with_model(self._model, crop)
-
-    def _predict_with_model(self, model: YOLO | None, crop: np.ndarray) -> tuple[bool, float]:
-        if model is None or crop.size == 0:
-            return False, 0.0
-
-        results = model.predict(crop, verbose=False, imgsz=224)
-        probs = results[0].probs
-        if probs is None:
-            return False, 0.0
-
-        top_index = int(probs.top1)
-        confidence = float(probs.top1conf.item())
-        class_name = str(results[0].names.get(top_index, "")).strip().lower()
-        return class_name == "ambulance" and confidence >= 0.65, round(confidence, 3)
 
 
 class VehicleDetector:
@@ -145,7 +110,7 @@ class VehicleDetector:
             "locked": False,
         }
         self._lock = asyncio.Lock()
-        self._ambulance_classifier = AmbulanceYoloClassifier()
+        self._ambulance_detector = AmbulanceDetector()
 
     def _resolve_stream_key(self, source_type: str, stream_id: str | None, filename: str | None = None) -> str:
         raw = (stream_id or Path(filename or "").stem or source_type).strip().lower()
@@ -260,7 +225,7 @@ class VehicleDetector:
             )
         if content_type.startswith("video/"):
             await self._get_model()
-            await self._ambulance_classifier._get_model()
+            # New detector handles its own model loading/lazy-load
             stream_key = self._resolve_stream_key("video", stream_id, filename)
             self._set_homography_calibration(
                 stream_key,
@@ -272,7 +237,9 @@ class VehicleDetector:
 
     async def _analyze_frame(self, frame: np.ndarray, *, source_type: str, stream_key: str, fps: float) -> Dict[str, Any]:
         model = await self._get_tracking_model(stream_key)
+        started = time.perf_counter()
         results = await asyncio.to_thread(self._track_frame, model, frame, video_mode=source_type == "video")
+        process_time = round(float(time.perf_counter() - started), 6)
         detections, uncertain_detections = await self._build_detection_lists_async(frame, results[0].boxes, results[0].names)
         tracking_metrics = self._update_tracking_metrics(
             stream_key=stream_key,
@@ -331,6 +298,7 @@ class VehicleDetector:
             "calibration_active": stream_key in self._calibration_state,
             "breakdown": {"ambulance": emergency_count, "fire_engine": 0},
             "processed_at": round(time.time(), 6),
+            "process_time": process_time,
         }
 
     def _analyze_video_bytes(
@@ -461,7 +429,9 @@ class VehicleDetector:
 
     def _analyze_frame_sync(self, frame: np.ndarray, *, source_type: str, stream_key: str, fps: float) -> Dict[str, Any]:
         model = self._get_tracking_model_sync(stream_key)
+        started = time.perf_counter()
         results = self._track_frame(model, frame, video_mode=source_type == "video")
+        process_time = round(float(time.perf_counter() - started), 6)
         detections, uncertain_detections = self._build_detection_lists_sync(frame, results[0].boxes, results[0].names)
         tracking_metrics = self._update_tracking_metrics(
             stream_key=stream_key,
@@ -519,6 +489,7 @@ class VehicleDetector:
             "calibration_active": stream_key in self._calibration_state,
             "breakdown": {"ambulance": emergency_count, "fire_engine": 0},
             "processed_at": round(time.time(), 6),
+            "process_time": process_time,
         }
 
     def _decode_image(self, image_bytes: bytes) -> np.ndarray:
@@ -626,9 +597,21 @@ class VehicleDetector:
         crop = self._crop_roi(frame, x1, y1, x2, y2)
         if crop is None:
             return [], False, 0.0
-        cues = self._collect_ambulance_cues(crop)
-        classifier_match, confidence = await self._ambulance_classifier.predict(crop)
-        return cues, self._resolve_ambulance_decision(base_label, cues, classifier_match, confidence), confidence
+        
+        # Use the high-precision hybrid detector
+        refinement = await asyncio.to_thread(self._ambulance_detector.refine_crop, crop)
+        
+        is_ambulance = refinement["ambulance_detected"]
+        evidence = refinement["evidence"]
+        
+        # Map evidence back to 'cues' for compatibility with existing metrics
+        cues = []
+        if evidence["ocr_text"]: cues.append("ambulance_text")
+        if evidence["light_detected"]: cues.append("emergency_lights")
+        if evidence["model_agreement"]: cues.append("model_verifed")
+        
+        # Note: We prioritize the new detector's decision
+        return cues, is_ambulance, 0.85 if is_ambulance else 0.0
 
     def _classify_ambulance_sync(
         self,
@@ -645,9 +628,19 @@ class VehicleDetector:
         crop = self._crop_roi(frame, x1, y1, x2, y2)
         if crop is None:
             return [], False, 0.0
-        cues = self._collect_ambulance_cues(crop)
-        classifier_match, confidence = self._ambulance_classifier.predict_sync(crop)
-        return cues, self._resolve_ambulance_decision(base_label, cues, classifier_match, confidence), confidence
+        
+        # Use the high-precision hybrid detector
+        refinement = self._ambulance_detector.refine_crop(crop)
+        
+        is_ambulance = refinement["ambulance_detected"]
+        evidence = refinement["evidence"]
+        
+        cues = []
+        if evidence["ocr_text"]: cues.append("ambulance_text")
+        if evidence["light_detected"]: cues.append("emergency_lights")
+        if evidence["model_agreement"]: cues.append("model_verifed")
+        
+        return cues, is_ambulance, 0.85 if is_ambulance else 0.0
 
     def _resolve_ambulance_decision(
         self,
@@ -656,16 +649,8 @@ class VehicleDetector:
         classifier_match: bool,
         classifier_confidence: float,
     ) -> bool:
-        if base_label not in {"car", "bus", "truck"}:
-            return False
-
-        cue_set = set(cues)
-        strong_visual_match = len(cue_set) >= 2 or {"ambulance_text", "emergency_lights"}.issubset(cue_set)
-        if classifier_match and cue_set:
-            return True
-        if strong_visual_match and classifier_confidence >= 0.45:
-            return True
-        return False
+        """Legacy decision logic. Deprecated in favor of vision_module.detector."""
+        return classifier_match
 
     async def _build_detection_lists_async(
         self,
@@ -815,163 +800,7 @@ class VehicleDetector:
             return None
         return crop
 
-    def _collect_ambulance_cues(self, crop: np.ndarray) -> list[str]:
-        cues: list[str] = []
-        if self._has_ambulance_text_cue(crop):
-            cues.append("ambulance_text")
-        if self._has_red_cross_symbol(crop):
-            cues.append("red_cross")
-        if self._has_emergency_lights(crop):
-            cues.append("emergency_lights")
-        return cues
 
-    def _has_ambulance_text_cue(self, crop: np.ndarray) -> bool:
-        if crop.size == 0:
-            return False
-
-        processed = self._prepare_text_candidate(crop)
-        if processed is None:
-            return False
-
-        best_score = 0.0
-        for word in AMBULANCE_TEXT_VARIANTS:
-            score = self._match_rendered_word(processed, word)
-            if score > best_score:
-                best_score = score
-        return best_score >= AMBULANCE_TEXT_MATCH_THRESHOLD
-
-    def _prepare_text_candidate(self, crop: np.ndarray) -> np.ndarray | None:
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        enlarged = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-        filtered = cv2.bilateralFilter(enlarged, 7, 50, 50)
-        _, binary = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        inverted = cv2.bitwise_not(binary)
-
-        candidates = [binary, inverted]
-        best: np.ndarray | None = None
-        best_width = 0
-
-        for image in candidates:
-            contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-
-            boxes: list[tuple[int, int, int, int]] = []
-            image_h, image_w = image.shape[:2]
-            min_area = max(40, int(image_h * image_w * 0.0008))
-            for contour in contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                area = w * h
-                if area < min_area:
-                    continue
-                if h < image_h * 0.08:
-                    continue
-                if w / max(h, 1) > 4.5:
-                    boxes.append((x, y, w, h))
-
-            if not boxes:
-                continue
-
-            left = min(box[0] for box in boxes)
-            top = min(box[1] for box in boxes)
-            right = max(box[0] + box[2] for box in boxes)
-            bottom = max(box[1] + box[3] for box in boxes)
-            roi = image[max(0, top - 8) : min(image_h, bottom + 8), max(0, left - 8) : min(image_w, right + 8)]
-            if roi.size == 0:
-                continue
-            if roi.shape[1] > best_width:
-                best = roi
-                best_width = roi.shape[1]
-
-        return best
-
-    def _match_rendered_word(self, candidate: np.ndarray, word: str) -> float:
-        if candidate.size == 0:
-            return 0.0
-
-        candidate_h, candidate_w = candidate.shape[:2]
-        candidate_prepped = cv2.resize(candidate, (max(candidate_w, 120), 80), interpolation=cv2.INTER_AREA if candidate_w > 120 else cv2.INTER_CUBIC)
-        candidate_prepped = cv2.GaussianBlur(candidate_prepped, (3, 3), 0)
-
-        fonts = [
-            cv2.FONT_HERSHEY_SIMPLEX,
-            cv2.FONT_HERSHEY_DUPLEX,
-            cv2.FONT_HERSHEY_TRIPLEX,
-            cv2.FONT_HERSHEY_COMPLEX,
-        ]
-        best = 0.0
-        for font in fonts:
-            template = np.zeros((80, 240), dtype=np.uint8)
-            cv2.putText(template, word, (6, 56), font, 1.0, 255, 2, cv2.LINE_AA)
-            template = cv2.GaussianBlur(template, (3, 3), 0)
-            resized_candidate = cv2.resize(candidate_prepped, (template.shape[1], template.shape[0]), interpolation=cv2.INTER_CUBIC)
-            score = float(cv2.matchTemplate(resized_candidate, template, cv2.TM_CCOEFF_NORMED)[0][0])
-            best = max(best, score)
-        return best
-
-    def _has_red_cross_symbol(self, crop: np.ndarray) -> bool:
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        lower_red_a = np.array([0, 90, 70], dtype=np.uint8)
-        upper_red_a = np.array([12, 255, 255], dtype=np.uint8)
-        lower_red_b = np.array([168, 90, 70], dtype=np.uint8)
-        upper_red_b = np.array([180, 255, 255], dtype=np.uint8)
-        red_mask = cv2.inRange(hsv, lower_red_a, upper_red_a) | cv2.inRange(hsv, lower_red_b, upper_red_b)
-        kernel = np.ones((3, 3), np.uint8)
-        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
-        red_ratio = float(np.count_nonzero(red_mask)) / float(red_mask.size or 1)
-        if red_ratio < RED_CROSS_RED_RATIO_THRESHOLD:
-            return False
-
-        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        crop_h, crop_w = red_mask.shape[:2]
-        min_area = max(35, int(crop_h * crop_w * 0.004))
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < min_area:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect = w / max(h, 1)
-            if aspect < 0.65 or aspect > 1.35:
-                continue
-            roi = red_mask[y : y + h, x : x + w]
-            vertical = roi[:, max(0, int(w * 0.35)) : min(w, int(w * 0.65))]
-            horizontal = roi[max(0, int(h * 0.35)) : min(h, int(h * 0.65)), :]
-            if vertical.size == 0 or horizontal.size == 0:
-                continue
-            vertical_ratio = float(np.count_nonzero(vertical)) / float(vertical.size)
-            horizontal_ratio = float(np.count_nonzero(horizontal)) / float(horizontal.size)
-            if vertical_ratio >= 0.38 and horizontal_ratio >= 0.38:
-                return True
-        return False
-
-    def _has_emergency_lights(self, crop: np.ndarray) -> bool:
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        upper_band = hsv[: max(1, int(hsv.shape[0] * 0.35)), :]
-        if upper_band.size == 0:
-            return False
-
-        lower_blue = np.array([95, 110, 120], dtype=np.uint8)
-        upper_blue = np.array([130, 255, 255], dtype=np.uint8)
-        lower_red_a = np.array([0, 120, 140], dtype=np.uint8)
-        upper_red_a = np.array([12, 255, 255], dtype=np.uint8)
-        lower_red_b = np.array([168, 120, 140], dtype=np.uint8)
-        upper_red_b = np.array([180, 255, 255], dtype=np.uint8)
-
-        blue_mask = cv2.inRange(upper_band, lower_blue, upper_blue)
-        red_mask = cv2.inRange(upper_band, lower_red_a, upper_red_a) | cv2.inRange(upper_band, lower_red_b, upper_red_b)
-        light_mask = blue_mask | red_mask
-        light_ratio = float(np.count_nonzero(light_mask)) / float(light_mask.size or 1)
-        if light_ratio < EMERGENCY_LIGHT_RATIO_THRESHOLD:
-            return False
-
-        contours, _ = cv2.findContours(light_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        bright_blobs = 0
-        min_area = max(6, int(upper_band.shape[0] * upper_band.shape[1] * 0.0007))
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area >= min_area:
-                bright_blobs += 1
-        return bright_blobs >= 2
 
     def _front_view_features(
         self,
@@ -1226,8 +1055,9 @@ class VehicleDetector:
                     "confidence": round(float(track_data.get("confidence") or 0.0), 3),
                     "direction": str(track_data.get("direction") or "unknown"),
                     "movement": str(track_data.get("movement") or "entry"),
-                    "speed": round(speed, 2),
-                    "speed_kmph": round(speed_kmph, 2),
+                    "elapsed": round(float(age_frames) / 30.0, 1), # Assuming 30 FPS if not defined
+                    "speed": round(float(speed), 2),
+                    "speed_kmph": round(float(speed_kmph), 2),
                     "speed_category": self._speed_category(speed),
                     "speed_category_kmph": self._speed_category_kmph(speed_kmph) if speed_kmph > 0.0 else "uncalibrated",
                     "flags": list(track_data.get("flags", [])),
@@ -1750,6 +1580,9 @@ class SimulationRuntime:
 
     def __init__(self) -> None:
         self.engine = TrafficNetwork()
+        use_mock = os.getenv("MOCK_HW", "false").lower() == "true"
+        port = os.getenv("SERIAL_PORT", "COM5")
+        self.hw = SignalController(port=port, mock=use_mock)
         self.connections: Set[WebSocket] = set()
         self.lock = asyncio.Lock()
         self.running = False
@@ -1757,6 +1590,10 @@ class SimulationRuntime:
         self.external_events = deque(maxlen=EXTERNAL_EVENT_LIMIT)
         self.last_alert_at: Dict[str, float] = {}
         self.latest_snapshot = self.engine.tick(FRAME_DT)
+        if hasattr(self.latest_snapshot, "to_dict"):
+            self.latest_snapshot = self.latest_snapshot.to_dict()
+        elif not isinstance(self.latest_snapshot, dict):
+            self.latest_snapshot = dict(self.latest_snapshot)
         self.latest_snapshot = self._merge_external_events(self.latest_snapshot)
 
     async def start(self) -> None:
@@ -1779,11 +1616,23 @@ class SimulationRuntime:
         while self.running:
             started = time.perf_counter()
             async with self.lock:
-                self.latest_snapshot = self._merge_external_events(self.engine.tick(FRAME_DT))
+                snapshot = self.engine.tick(FRAME_DT)
+                if hasattr(snapshot, "to_dict"):
+                    snapshot = snapshot.to_dict()
+                elif not isinstance(snapshot, dict):
+                    snapshot = dict(snapshot)
+                self.latest_snapshot = self._merge_external_events(snapshot)
+                
+                # Mirror the simulation state to the Arduino Hardware
+                self.hw.update(
+                    active_direction=self.latest_snapshot.get("active_direction"),
+                    phase_state=self.engine.engine.phase_state,
+                    pedestrian_active=self.latest_snapshot.get("pedestrian_phase_active", False)
+                )
                 payload = {
                     "type": "snapshot",
-                    "snapshot": self.latest_snapshot,
-                    "sent_at": round(time.time(), 6),
+                    "snapshot": {**self.latest_snapshot, "hw_command": self.hw.last_command},
+                    "sent_at": round(float(time.time()), 6),
                 }
             await self._broadcast(payload)
             elapsed = time.perf_counter() - started
@@ -1853,6 +1702,19 @@ class SimulationRuntime:
                 self.engine.reset(config if isinstance(config, dict) else None)
             elif message_type == "ping":
                 return {"type": "pong", "sent_at": round(time.time(), 6)}
+            elif message_type == "set_hardware_state":
+                command = str(message.get("command", "")).upper()
+                # Manual override for hardware state
+                if self.hw._connected:
+                    self.hw.last_command = command
+                    print(f"[HW] Manual override command: {command}")
+                    if not self.hw.mock:
+                        try:
+                            self.hw.ser.write(f"{command}\n".encode('utf-8'))
+                        except Exception as e:
+                            print(f"[HW] Manual write failed: {e}")
+                            self.hw._connected = False
+                return {"type": "ack", "action": "set_hardware_state", "command": command}
             else:
                 return {"type": "error", "message": f"Unknown message type: {message_type or 'empty'}"}
 
@@ -1860,7 +1722,10 @@ class SimulationRuntime:
             return {"type": "ack", "action": message_type, "snapshot": self.latest_snapshot, "sent_at": round(time.time(), 6)}
 
     def _merge_external_events(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-        merged_snapshot = dict(snapshot)
+        if hasattr(snapshot, "to_dict"):
+            merged_snapshot = snapshot.to_dict()
+        else:
+            merged_snapshot = dict(snapshot)
         engine_events = list(snapshot.get("events", []))
         merged_events = [*list(self.external_events), *engine_events][:40]
         merged_snapshot["events"] = merged_events

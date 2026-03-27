@@ -10,12 +10,22 @@ __pycache__/
 
 frontend/node_modules/
 frontend/dist/
+node_modules/
+dist/
 
+# Dataset & Models
+vehicle_dataset/
 models/ambulance_yolo_cls_run/
 .yolo-config/
+*.pt
 
+# System & IDE
 inspect_output.txt
-
 Thumbs.db
 .DS_Store
-
+.vscode/
+.idea/
+.pytest_cache/
+.coverage
+*.env.*
+!.env.example
