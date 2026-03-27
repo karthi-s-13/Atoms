@@ -1,31 +1,60 @@
-.env
-.venv/
+# Standard .gitignore for Python (Streamlit) + React (Vite)
+
+# --- Python ---
 __pycache__/
 *.py[cod]
-*.pyc.*
-*.cache
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+.pytest_cache/
+.coverage
+htmlcov/
 *.log
 *.tmp
 *.backup
+.python-version
 
-frontend/node_modules/
-frontend/dist/
+# --- Node.js / Vite ---
 node_modules/
+frontend/node_modules/
 dist/
+frontend/dist/
+.vite/
+frontend/.vite/
+.eslintcache
+.stylelintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Dataset & Models
-vehicle_dataset/
-models/ambulance_yolo_cls_run/
-.yolo-config/
-*.pt
-
-# System & IDE
-inspect_output.txt
-Thumbs.db
-.DS_Store
-.vscode/
-.idea/
-.pytest_cache/
-.coverage
+# --- Environment ---
+.env
 *.env.*
 !.env.example
+
+# --- ML / Datasets ---
+vehicle_dataset/
+models/
+*.pt
+*.pth
+*.onnx
+*.weights
+.yolo-config/
+
+# --- IDE / System ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+inspect_output.txt
+
+# --- Build / Temporary ---
+target/
+build/
+out/
+bin/
+obj/
