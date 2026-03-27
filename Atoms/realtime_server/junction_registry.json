@@ -1,0 +1,94 @@
+{
+  "junctions": [
+    {
+      "junction_id": "J1",
+      "name": "Central Station",
+      "lat": 13.0827,
+      "lng": 80.2707,
+      "camera_id": "cam-central-01",
+      "region": "chennai-core",
+      "status": "active",
+      "neighbors": ["J2", "J3"],
+      "base_metrics": {
+        "vehicle_count": 25,
+        "queue": 15,
+        "density": 0.75,
+        "flow_count": 18,
+        "accident": false,
+        "average_speed_kmph": 24.0
+      }
+    },
+    {
+      "junction_id": "J2",
+      "name": "Harbor North",
+      "lat": 13.0674,
+      "lng": 80.2376,
+      "camera_id": "cam-harbor-02",
+      "region": "chennai-north",
+      "status": "active",
+      "neighbors": ["J1", "J4", "J3"],
+      "base_metrics": {
+        "vehicle_count": 10,
+        "queue": 5,
+        "density": 0.3,
+        "flow_count": 9,
+        "accident": false,
+        "average_speed_kmph": 31.0
+      }
+    },
+    {
+      "junction_id": "J3",
+      "name": "South Market",
+      "lat": 13.0569,
+      "lng": 80.2425,
+      "camera_id": "cam-market-03",
+      "region": "chennai-south",
+      "status": "active",
+      "neighbors": ["J1", "J4", "J2"],
+      "base_metrics": {
+        "vehicle_count": 40,
+        "queue": 25,
+        "density": 0.9,
+        "flow_count": 24,
+        "accident": true,
+        "average_speed_kmph": 18.0
+      }
+    },
+    {
+      "junction_id": "J4",
+      "name": "IT Corridor",
+      "lat": 13.0455,
+      "lng": 80.2341,
+      "camera_id": "cam-it-04",
+      "region": "chennai-west",
+      "status": "active",
+      "neighbors": ["J2", "J3", "J5"],
+      "base_metrics": {
+        "vehicle_count": 18,
+        "queue": 8,
+        "density": 0.5,
+        "flow_count": 14,
+        "accident": false,
+        "average_speed_kmph": 28.0
+      }
+    },
+    {
+      "junction_id": "J5",
+      "name": "Medical Link",
+      "lat": 13.0392,
+      "lng": 80.2298,
+      "camera_id": "cam-medical-05",
+      "region": "chennai-southwest",
+      "status": "active",
+      "neighbors": ["J3", "J4"],
+      "base_metrics": {
+        "vehicle_count": 14,
+        "queue": 6,
+        "density": 0.42,
+        "flow_count": 11,
+        "accident": false,
+        "average_speed_kmph": 29.0
+      }
+    }
+  ]
+}
