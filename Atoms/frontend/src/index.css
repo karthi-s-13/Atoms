@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  font-family: Inter, "Segoe UI", sans-serif;
+  background: #06111f;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  @apply bg-canvas text-slate-100;
+  background-image:
+    radial-gradient(circle at top left, rgba(34, 211, 238, 0.16), transparent 28%),
+    radial-gradient(circle at top right, rgba(56, 189, 248, 0.08), transparent 24%),
+    linear-gradient(180deg, #07111d 0%, #040a14 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.glass-panel {
+  @apply border border-white/10 bg-white/5 backdrop-blur-xl shadow-glow;
+}
+
+.metric-value {
+  @apply text-3xl font-semibold tracking-tight text-white;
+}
+
+.metric-label {
+  @apply text-xs uppercase tracking-[0.24em] text-slate-400;
+}
+
+.accent-ring {
+  box-shadow:
+    0 0 0 1px rgba(34, 211, 238, 0.16),
+    0 18px 60px rgba(8, 47, 73, 0.35);
+}
+
+.panel-title {
+  @apply text-sm font-medium uppercase tracking-[0.28em] text-slate-400;
+}
